@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="MediRoute - Rural Healthcare & Emergency Care Platform">
+  <title>MediRoute — Rural Healthcare &amp; Emergency Coordination</title>
+  <link rel="stylesheet" href="/styles.css?v=3.2">
+</head>
+<body>
+  <main class="shell">
+    <section id="login-view" class="auth-card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; gap:10px;">
+        <span class="eyebrow" id="login-eyebrow">RURAL HEALTHCARE &amp; EMERGENCY CARE</span>
+        <select id="login-language" class="lang-picker" aria-label="Language Selector">
+          <option value="en">English (English)</option>
+          <option value="hi">हिन्दी (Hindi)</option>
+          <option value="bn">বাংলা (Bengali)</option>
+          <option value="mr">मराठी (Marathi)</option>
+          <option value="ta">தமிழ் (Tamil)</option>
+          <option value="te">తెలుగు (Telugu)</option>
+        </select>
+      </div>
+      <h1 id="login-title">MediRoute</h1>
+      <p class="muted" id="login-desc">Connected care, referrals and emergency coordination. Clinical decisions remain with qualified professionals.</p>
+
+      <!-- Auth Navigation Tabs -->
+      <div class="auth-tabs" role="tablist" aria-label="Account Access Tabs">
+        <button type="button" id="tab-signin-btn" class="auth-tab-btn active" role="tab" aria-selected="true" aria-controls="login-form-container">
+          🔑 Sign In
+        </button>
+        <button type="button" id="tab-register-btn" class="auth-tab-btn" role="tab" aria-selected="false" aria-controls="register-form-container">
+          📝 Create Account
+        </button>
+      </div>
+      
+      <!-- Tab 1: Sign In -->
+      <div id="login-form-container">
+        <form id="login-form">
+          <label id="login-email-label">
+            <span id="login-email-text">Email</span>
+            <input id="email" name="email" type="email" value="patient@mediroute.demo" required autocomplete="email">
+          </label>
+          <label id="login-pass-label">
+            <span id="login-pass-text">Password</span>
+            <input id="password" name="password" type="password" value="MediRoute!2026" required autocomplete="current-password">
+          </label>
+          <button id="login-btn" type="submit">Sign in securely</button>
+        </form>
+
+        <p id="login-error" class="error" role="alert"></p>
+
+        <div class="demo-box" style="margin-top:16px; padding:14px; background:#f0f7f7; border:1px solid #cbe0e2; border-radius:10px;">
+          <div style="font-weight:700; font-size:0.85rem; color:#0b2533; margin-bottom:8px;" id="login-demo-summary">⚡ Quick Demo Role Logins:</div>
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(130px, 1fr)); gap:6px;">
+            <button type="button" class="quiet demo-btn" data-email="patient@mediroute.demo" style="padding:6px 8px; font-size:0.8rem;">👤 Patient</button>
+            <button type="button" class="quiet demo-btn" data-email="hospital@mediroute.demo" style="padding:6px 8px; font-size:0.8rem;">🏥 Hospital</button>
+            <button type="button" class="quiet demo-btn" data-email="doctor@mediroute.demo" style="padding:6px 8px; font-size:0.8rem;">👨‍⚕️ Doctor</button>
+            <button type="button" class="quiet demo-btn" data-email="driver@mediroute.demo" style="padding:6px 8px; font-size:0.8rem;">🚑 Driver</button>
+            <button type="button" class="quiet demo-btn" data-email="admin@mediroute.demo" style="padding:6px 8px; font-size:0.8rem;">⚙️ Admin</button>
+            <button type="button" class="quiet demo-btn" data-email="government@mediroute.demo" style="padding:6px 8px; font-size:0.8rem;">🏛️ Government</button>
+          </div>
+          <p style="font-size:0.75rem; color:#58707c; margin:8px 0 0;" id="login-demo-hint">Password for all accounts: <code>MediRoute!2026</code></p>
+        </div>
+      </div>
+
+      <!-- Tab 2: Create Account -->
+      <div id="register-form-container" style="display:none;">
+        <form id="register-form">
+          <label>
+            <span>Choose Your Role &amp; Access Tier *</span>
+            <select id="reg-role" name="role" required style="font-weight:600; background:#f9fdfd; border-color:#087f76;">
+              <option value="PATIENT">👤 Patient / Citizen (Emergency &amp; Care Access)</option>
+              <option value="HOSPITAL">🏥 Hospital Administrator &amp; Facility Management</option>
+              <option value="DOCTOR">👨‍⚕️ Medical Doctor / Clinical Specialist</option>
+              <option value="AMBULANCE_DRIVER">🚑 Emergency Ambulance Fleet Driver</option>
+              <option value="GOVERNMENT_AUTHORITY">🏛️ Government Health Authority / District Oversight</option>
+              <option value="ADMIN">⚙️ System Administrator / Platform Operations</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Full Name / Facility Title *</span>
+            <input id="reg-full-name" name="full_name" type="text" placeholder="e.g. Dr. Aryan Sharma / Metro Emergency Center" required autocomplete="name">
+          </label>
+
+          <label>
+            <span>Email Address *</span>
+            <input id="reg-email" name="email" type="email" placeholder="name@domain.com" required autocomplete="email">
+          </label>
+
+          <div id="reg-hospital-wrap" style="display:none;">
+            <label>
+              <span>Affiliated Hospital / Clinical Facility *</span>
+              <select id="reg-hospital-id" name="hospital_id">
+                <option value="1">MediRoute District Hospital (Mathura Corridor)</option>
+                <option value="2">MediRoute Specialist Centre (Mathura Campus)</option>
+              </select>
+            </label>
+          </div>
+
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <label>
+              <span>Password *</span>
+              <input id="reg-password" name="password" type="password" placeholder="Min 6 characters" required autocomplete="new-password">
+            </label>
+            <label>
+              <span>Confirm Password *</span>
+              <input id="reg-confirm-password" name="confirm_password" type="password" placeholder="Re-enter password" required autocomplete="new-password">
+            </label>
+          </div>
+
+          <div style="background:#eef7f6; border-left:3px solid #087f76; padding:10px 12px; border-radius:6px; font-size:0.8rem; color:#0b2533;">
+            ℹ️ <strong>Role Terms Review:</strong> Upon clicking submit, you will review and accept the legally binding Terms &amp; Conditions and Blacklisting Regulations for your selected role.
+          </div>
+
+          <button id="register-btn" type="submit" style="background:#087f76; font-size:0.95rem;">
+            Review Role Terms &amp; Complete Registration →
+          </button>
+        </form>
+
+        <p id="register-error" class="error" role="alert"></p>
+        <p id="register-success" class="success" role="status"></p>
+      </div>
+
+      <div style="margin-top:16px; text-align:center;">
+        <button type="button" id="btn-public-terms" class="quiet" style="font-size:0.8rem; padding:6px 12px; border:1px dashed #087f76; color:#087f76; background:#eef7f6; border-radius:6px; cursor:pointer; font-weight:600;">
+          📜 View Role-Based Terms, Conditions &amp; Blacklisting Policy
+        </button>
+      </div>
+      <div id="public-terms-modal" style="display:none; margin-top:16px; border-top:1px solid #cbe0e2; padding-top:14px;"></div>
+    </section>
+
+    <!-- Modal Pop-Up for Role Terms & Conditions -->
+    <div id="terms-modal-overlay" class="modal-overlay" style="display:none;">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="terms-modal-title">
+        <div class="modal-header">
+          <h3 id="terms-modal-title">
+            <span>📜</span>
+            <span id="terms-modal-role-title">Role-Specific Terms &amp; Conditions</span>
+          </h3>
+          <button type="button" id="terms-modal-close-btn" class="quiet" style="padding:4px 8px; font-size:0.9rem; background:rgba(255,255,255,0.15); color:#fff; border-radius:6px;" aria-label="Close Terms Modal">✕</button>
+        </div>
+        <div class="modal-body" id="terms-modal-body">
+          <!-- Dynamic Role Content Injected Here -->
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="terms-decline-btn" class="quiet" style="font-weight:600;">Back &amp; Edit Details</button>
+          <button type="button" id="terms-accept-btn" disabled style="background:#087f76; font-weight:700;">
+            ✓ Accept Terms &amp; Create Account
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Application Dashboard View -->
+    <section id="app-view" hidden>
+      <header>
+        <div>
+          <span class="eyebrow" id="app-header-eyebrow">MEDIROUTE</span>
+          <h1 id="welcome">Welcome</h1>
+        </div>
+        <div class="header-actions">
+          <select id="language" class="lang-picker" aria-label="Dashboard Language Selector">
+            <option value="en">English (English)</option>
+            <option value="hi">हिन्दी (Hindi)</option>
+            <option value="bn">বাংলা (Bengali)</option>
+            <option value="mr">मराठी (Marathi)</option>
+            <option value="ta">தமிழ் (Tamil)</option>
+            <option value="te">తెలుగు (Telugu)</option>
+          </select>
+          <button class="quiet" id="logout">Sign out</button>
+        </div>
+      </header>
+      <nav id="nav" aria-label="Dashboard navigation"></nav>
+      <p id="status" class="status" role="status"></p>
+      <section id="content" class="content" aria-live="polite"></section>
+    </section>
+  </main>
+  <script src="/app.js?v=3.2" defer></script>
+</body>
+</html>
