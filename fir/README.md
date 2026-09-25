@@ -10,8 +10,8 @@ MediRoute is a working FastAPI healthcare and emergency-care platform that surro
 
 2. Copy `.env.example` to `.env`, set a strong `JWT_SECRET`, and set `DATABASE_URL` to PostgreSQL for shared/deployed environments. The local demo falls back to `sqlite:///./mediroute.db`.
 3. Run `.\.venv\Scripts\uvicorn mediroute.app:app --reload --port 8000`.
-4. Open `http://127.0.0.1:8000`. Interactive API documentation is at `/docs` and OpenAPI JSON is at `/openapi.json`.
-5. Run the protected map system separately, unchanged, and set `MAP_BRIDGE_URL` to its Flask URL (normally `http://127.0.0.1:5000`).
+4. Open `http://127.0.0.1:8000`. Interactive API documentation is at `/docs`, OpenAPI JSON is at `/openapi.json`, and health checks are available at `/health`, `/healthz`, and `/api/health`.
+5. Run the protected map system separately, unchanged, and set `MAP_BRIDGE_URL` to its Flask URL (normally `http://127.0.0.1:5000`, with its health check at `http://127.0.0.1:5000/api/health`).
 
 ## Demo credentials
 

@@ -56,7 +56,15 @@ def test_auth_and_registration():
 
 def test_end_to_end_healthcare_workflow():
     with TestClient(app) as client:
-        assert client.get("/api/health").status_code == 200
+        # Verify all health check endpoints and DB status
+        for route in ("/health", "/healthz", "/api/health"):
+            res = client.get(route)
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "ok"
+            assert data["database"] == "healthy"
+            assert data["service"] == "MediRoute"
+
         patient_headers = login(client, "patient")
         hospital_headers = login(client, "hospital")
         driver_headers = login(client, "driver")

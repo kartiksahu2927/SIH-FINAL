@@ -127,9 +127,25 @@ async def persist_notice(db: Session, user_id: int, title: str, body: str, kind:
     await manager.send(user_id, {"event": "notification", "title": title, "body": body, "kind": kind, "reference": reference or {}})
 
 
+@app.get("/health", tags=["system"])
+@app.get("/healthz", tags=["system"])
 @app.get("/api/health", tags=["system"])
-def health() -> dict:
-    return {"status": "ok", "service": "MediRoute", "map_bridge": bridge.base_url}
+def health(db: Session = Depends(get_db)) -> dict:
+    from sqlalchemy import text
+    db_status = "healthy"
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as exc:
+        db_status = f"unhealthy: {exc}"
+
+    return {
+        "status": "ok" if db_status == "healthy" else "degraded",
+        "service": "MediRoute",
+        "database": db_status,
+        "map_bridge": bridge.base_url,
+        "timestamp": utc_iso(),
+        "version": "2.0.0"
+    }
 
 
 @app.post("/api/auth/register", tags=["authentication"], status_code=201)
