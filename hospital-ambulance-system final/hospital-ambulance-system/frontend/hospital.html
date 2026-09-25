@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JS Hospital — Emergency Triage Reception Dashboard (Device 2)</title>
+
+  <!-- Google Fonts: Outfit & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet">
+
+  <!-- Hospital Dashboard Styles -->
+  <link rel="stylesheet" href="css/hospital.css">
+</head>
+
+<body>
+
+  <!-- ==================== TOP BAR ==================== -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="hospital-logo">🏥</div>
+      <div>
+        <div class="topbar-title">
+          JS Hospital <span class="demo-tag">Emergency Reception • Device 2</span>
+        </div>
+        <div class="topbar-sub">Real-Time Emergency Reception &amp; Triage Gateway</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <button id="btn-sound-test" class="device-badge"
+        style="background:#1e293b; color:#38bdf8; border:1px solid #38bdf8; cursor:pointer; font-weight:700;"
+        title="Test and enable emergency alert audio">
+        🔊 Test Siren Sound
+      </button>
+      <div class="status-badge">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">🟢 Hospital Online (Socket.IO Connected)</span>
+      </div>
+      <a href="/ambulance" target="_blank" class="device-badge" style="text-decoration:none;"
+        title="Open Ambulance Dashboard (Device 1)">
+        🚑 Switch to Ambulance (Device 1) ↗
+      </a>
+    </div>
+  </header>
+
+  <!-- ==================== MAIN 2-COLUMN LAYOUT ==================== -->
+  <main class="main-layout">
+
+    <!-- LEFT COLUMN: Hospital Live Capacity & Facility Telemetry -->
+    <section class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>🩺</span> Hospital Availability &amp; Critical Readiness
+        </div>
+        <span
+          style="font-size:0.75rem; color:#34d399; font-weight:700; background:rgba(16,185,129,0.15); padding:3px 8px; border-radius:4px;">
+          🟢 All Systems Normal
+        </span>
+      </div>
+
+      <!-- Capacity Metrics Grid -->
+      <div class="metrics-grid">
+        <div class="metric-box">
+          <div class="metric-label">Emergency Beds</div>
+          <div class="metric-val avail" id="hosp-er-beds">15 / 20 Free</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">ICU &amp; Critical Units</div>
+          <div class="metric-val avail" id="hosp-icu-beds">6 / 8 Free</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Active Ventilators</div>
+          <div class="metric-val" id="hosp-vent-beds">4 / 6 Ready</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Oxygen Reserves</div>
+          <div class="metric-val avail" id="hosp-o2-pct">100% (96 hrs)</div>
+        </div>
+      </div>
+
+      <!-- Emergency Medical Specialists on Duty -->
+      <div style="margin-top: 18px;">
+        <div
+          style="font-size:0.78rem; text-transform:uppercase; color:var(--text-muted); font-weight:700; margin-bottom:6px; letter-spacing:0.5px;">
+          👨‍⚕️ Emergency Specialists on Shift (24x7)
+        </div>
+        <div class="specs-list">
+          <div class="spec-badge">
+            <span>Trauma Surgeon (Resuscitation Bay)</span>
+            <span class="dot"></span>
+          </div>
+          <div class="spec-badge">
+            <span>Cardiologist (Cath Lab)</span>
+            <span class="dot"></span>
+          </div>
+          <div class="spec-badge">
+            <span>Neurosurgeon (Floor Floor)</span>
+            <span class="dot"></span>
+          </div>
+          <div class="spec-badge">
+            <span>Anesthesiologist (Critical OT)</span>
+            <span class="dot"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Blood Bank Reserves -->
+      <div style="margin-top: 18px;">
+        <div
+          style="font-size:0.78rem; text-transform:uppercase; color:var(--text-muted); font-weight:700; margin-bottom:6px; letter-spacing:0.5px;">
+          🩸 Blood Bank Inventory
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <span
+            style="background:rgba(239,68,68,0.15); color:#fca5a5; border:1px solid rgba(239,68,68,0.3); padding:4px 10px; border-radius:6px; font-size:0.78rem; font-weight:700;">
+            O- Universal: 10 Units
+          </span>
+          <span
+            style="background:rgba(239,68,68,0.15); color:#fca5a5; border:1px solid rgba(239,68,68,0.3); padding:4px 10px; border-radius:6px; font-size:0.78rem; font-weight:700;">
+            O+: 25 Units
+          </span>
+          <span
+            style="background:rgba(239,68,68,0.15); color:#fca5a5; border:1px solid rgba(239,68,68,0.3); padding:4px 10px; border-radius:6px; font-size:0.78rem; font-weight:700;">
+            A+: 18 Units
+          </span>
+          <span
+            style="background:rgba(239,68,68,0.15); color:#fca5a5; border:1px solid rgba(239,68,68,0.3); padding:4px 10px; border-radius:6px; font-size:0.78rem; font-weight:700;">
+            B+: 20 Units
+          </span>
+        </div>
+      </div>
+
+      <!-- Critical Facilities -->
+      <div style="margin-top: 18px;">
+        <div
+          style="font-size:0.78rem; text-transform:uppercase; color:var(--text-muted); font-weight:700; margin-bottom:6px; letter-spacing:0.5px;">
+          🏥 Critical Facilities Status
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <span
+            style="background:#064e3b; color:#34d399; padding:4px 10px; border-radius:6px; font-size:0.78rem; font-weight:700;">
+            ✓ Cath Lab Ready
+          </span>
+          <span
+            style="background:#064e3b; color:#34d399; padding:4px 10px; border-radius:6px; font-size:0.78rem; font-weight:700;">
+            ✓ CT Scanner Active
+          </span>
+          <span
+            style="background:#064e3b; color:#34d399; padding:4px 10px; border-radius:6px; font-size:0.78rem; font-weight:700;">
+            ✓ Trauma Bay #1 &amp; #2 Free
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT COLUMN: Incoming Ambulance Stream & Live Dispatch Monitor -->
+    <section class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>📡</span> Live Incoming Ambulances &amp; Dispatch Queue
+        </div>
+        <span
+          style="font-size:0.75rem; color:#38bdf8; font-weight:700; background:rgba(56,189,248,0.15); padding:3px 8px; border-radius:4px;">
+          Live Telemetry Gateway
+        </span>
+      </div>
+
+      <!-- Queue Container -->
+      <div id="incoming-queue" class="queue-container">
+        <div class="queue-empty">
+          <div class="queue-empty-icon">📡</div>
+          <p><strong>Standing by for incoming emergency requests...</strong></p>
+          <small style="color:#64748b;">When an ambulance clicks "Emergency Patient Onboard" on Device 1, an emergency
+            popup will appear automatically here.</small>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ==================== DEMO CONTROL BAR ==================== -->
+  <footer class="demo-control-bar">
+    <div>
+      <strong>Live Operation:</strong> Connected to Ambulance Fleet &amp; Real-Time Emergency Gateway.
+    </div>
+    <button id="btn-demo-reset" class="btn-demo-reset" title="Reset emergency state">
+      🔄 Reset Emergency State
+    </button>
+  </footer>
+
+  <!-- ==================== PROMINENT REAL-TIME POPUP MODAL ==================== -->
+  <div id="emergency-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header-alert">
+        <h2>🚨 NEW EMERGENCY REQUEST</h2>
+        <span class="alert-pulse-tag">CRITICAL INCOMING</span>
+      </div>
+
+      <div class="modal-body">
+        <p style="font-size:0.9rem; color:#cbd5e1; line-height:1.4;">
+          An ambulance has triggered an immediate emergency patient onboard alert and requested priority admission at
+          this facility.
+        </p>
+
+        <!-- Requirements Table -->
+        <div class="detail-table">
+          <div class="detail-row">
+            <span>Hospital:</span>
+            <span id="modal-hospital-name" class="highlight-green">JS Hospital - Demo Hospital</span>
+          </div>
+          <div class="detail-row">
+            <span>Patient:</span>
+            <span id="modal-patient-name">Emergency Patient</span>
+          </div>
+          <div class="detail-row">
+            <span>Condition:</span>
+            <span id="modal-patient-condition" style="color:#f87171;">Severe Trauma / Critical Resuscitation</span>
+          </div>
+          <div class="detail-row">
+            <span>Ambulance:</span>
+            <span id="modal-ambulance-id">Unit 101 (ALS) • DL-01-EM-1081</span>
+          </div>
+          <div class="detail-row">
+            <span>Vehicle Type:</span>
+            <span id="modal-ambulance-type" style="font-size:0.8rem;">Advanced Life Support (ICU on Wheels)</span>
+          </div>
+          <div class="detail-row">
+            <span>Distance:</span>
+            <span id="modal-distance" class="highlight-yellow">1.4 km</span>
+          </div>
+          <div class="detail-row">
+            <span>ETA:</span>
+            <span id="modal-eta" class="highlight-yellow">4 minutes</span>
+          </div>
+          <div class="detail-row">
+            <span>Emergency Bed:</span>
+            <span id="modal-bed-status" class="highlight-green">Available</span>
+          </div>
+          <div class="detail-row">
+            <span>Required Facility:</span>
+            <span id="modal-facility-status" class="highlight-green">Available</span>
+          </div>
+          <div class="detail-row">
+            <span>Ambulance Live Address / Location:</span>
+            <span id="modal-location"
+              style="font-family:'JetBrains Mono',monospace; font-size:0.8rem; color:#93c5fd;">Mathura Rural Health
+              Corridor</span>
+          </div>
+        </div>
+
+        <!-- Legal Accountability Notice -->
+        <div
+          style="margin: 12px 0 16px; padding: 10px 14px; background: rgba(239,68,68,0.12); border: 1px solid #ef4444; border-radius: 8px; font-size: 0.78rem; color: #fca5a5; line-height: 1.4;">
+          ⚠️ <strong>Binding Hospital Accountability Agreement:</strong> Accepting this emergency request legally
+          mandates immediate patient reception &amp; committed bed/specialist provision. Unjustified refusal after
+          acceptance triggers automated escalation to Government Health Authorities and permanent network blacklisting.
+        </div>
+
+        <!-- Decision Status Banner -->
+        <div id="modal-status-banner" class="modal-status-banner"></div>
+
+        <!-- Decision Action Buttons -->
+        <div id="modal-actions" class="modal-actions">
+          <button id="modal-btn-accept" class="btn-modal btn-accept">
+            ✅ ACCEPT REQUEST
+          </button>
+          <button id="modal-btn-reject" class="btn-modal btn-reject">
+            ❌ REJECT REQUEST
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Socket.IO Real-Time Client -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
+  <!-- JS Hospital Dashboard Controller -->
+  <script src="js/hospital_dashboard.js"></script>
+
+</body>
+
+</html>

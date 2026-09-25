@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hospital & Ambulance Coordination System — Smart Fleet Navigation</title>
+  
+  <!-- Modern Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Outfit:wght@500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  
+  <!-- Leaflet CSS for universal interactive map fallback -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  
+  <!-- Main Stylesheet -->
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <!-- ==================== TOP BAR ==================== -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <div class="logo-pulse">
+        <span class="topbar-icon">🚑</span>
+      </div>
+      <div>
+        <h1>Hospital &amp; Ambulance Coordination System</h1>
+        <div class="topbar-sub">Real-Time Emergency Fleet &amp; Bed Navigation</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <a href="/hospital" target="_blank" class="stage-badge" style="text-decoration:none; background:#064e3b; color:#34d399; border:1px solid #059669; font-weight:700;" title="Open Device 2 (JS Hospital Reception Dashboard)">
+        🏥 Open JS Hospital (Device 2) ↗
+      </a>
+      <div id="engine-badge" class="engine-badge simulation">
+        <span class="badge-dot"></span>
+        <span id="engine-badge-text">OpenStreetMap &amp; Real Road Engine</span>
+      </div>
+      <span class="stage-badge">Fleet Active (4 Units)</span>
+    </div>
+  </header>
+
+  <!-- ==================== QUICK SIMULATION / ACTION BAR ==================== -->
+  <div class="simulation-bar">
+    <span class="sim-label">⚡ Live Ops &amp; Controls:</span>
+    <button id="sim-gps-btn" class="btn-sm" title="Advance active ambulance along real road network">
+      📍 Simulate Move
+    </button>
+    <button id="sim-stream-btn" class="btn-sm btn-live-stream" title="Pause or Resume continuous Live Telemetry feed">
+      🟢 Live Feed Active
+    </button>
+    <button id="sim-admission-btn" class="btn-sm" title="Simulate real-time emergency patient admission at selected hospital">
+      🚨 Patient Admission
+    </button>
+    <button id="sim-bed-btn" class="btn-sm" title="Toggle hospital bed & doctor availability">
+      🩺 Toggle Bed/Doctor
+    </button>
+    <button id="sim-response-btn" class="btn-sm" title="Simulate hospital accepting/rejecting request">
+      🏥 Hospital Response
+    </button>
+    <button id="sim-traffic-btn" class="btn-sm" title="Simulate traffic congestion alert">
+      🚦 Traffic Alert
+    </button>
+    <div class="sim-backend-status">
+      <span class="status-dot tracking" id="api-status-dot"></span>
+      <span id="api-status-text">🟢 <strong>LIVE TELEMETRY</strong> • 12+ Hospitals Live Sync</span>
+    </div>
+  </div>
+
+  <!-- ==================== MAIN 3-COLUMN CONTAINER ==================== -->
+  <main class="main-container">
+
+    <!-- LEFT PANEL: Fleet Switcher, GPS Status, Emergency Action & Hospital List -->
+    <aside class="panel panel-left" id="panel-left">
+      
+      <!-- Ambulance Fleet Unit Switcher -->
+      <div class="section-header">
+        <h2>Ambulance Fleet Selection</h2>
+        <span class="fleet-count-tag">4 Units Live</span>
+      </div>
+
+      <div class="fleet-switcher">
+        <button class="amb-unit-btn active" data-unit-id="AMB-101">
+          <span class="unit-code">AMB-101</span>
+          <span class="unit-type">ALS Unit</span>
+        </button>
+        <button class="amb-unit-btn" data-unit-id="AMB-102">
+          <span class="unit-code">AMB-102</span>
+          <span class="unit-type">ICU Unit</span>
+        </button>
+        <button class="amb-unit-btn" data-unit-id="AMB-103">
+          <span class="unit-code">AMB-103</span>
+          <span class="unit-type">BLS Unit</span>
+        </button>
+        <button class="amb-unit-btn" data-unit-id="AMB-104">
+          <span class="unit-code">AMB-104</span>
+          <span class="unit-type">NICU Unit</span>
+        </button>
+      </div>
+
+      <!-- Active Unit Telemetry Card -->
+      <div class="active-vehicle-card">
+        <div class="veh-header">
+          <div>
+            <div class="veh-callsign" id="active-amb-name">Ambulance Unit 101 (ALS)</div>
+            <div class="veh-plate" id="active-amb-plate">DL-01-EM-1081</div>
+          </div>
+          <span id="active-amb-status" class="status-pill status-emergency">DISPATCHED</span>
+        </div>
+        
+        <div class="veh-details-grid">
+          <div class="veh-stat">
+            <label>Crew</label>
+            <span id="active-amb-crew">Vikram Singh &amp; Dr. Sharma</span>
+          </div>
+          <div class="veh-stat">
+            <label>Speed</label>
+            <span id="active-amb-speed">48 km/h</span>
+          </div>
+          <div class="veh-stat">
+            <label>Oxygen</label>
+            <span id="active-amb-o2" style="color:#16a34a; font-weight:700;">98%</span>
+          </div>
+          <div class="veh-stat">
+            <label>Type</label>
+            <span id="active-amb-type">Advanced Life Support</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Ambulance Location & Address Tracking -->
+      <div class="section-header" style="margin-top:14px;">
+        <h2>Ambulance Live Address &amp; Location</h2>
+        <span class="pulse-indicator" id="gps-pulse"></span>
+      </div>
+
+      <!-- Driver Address Input & Geocoding Tracker -->
+      <div class="address-input-box" style="margin-bottom:10px;">
+        <label style="font-size:0.75rem; color:#94a3b8; font-weight:700; text-transform:uppercase; display:block; margin-bottom:4px;">
+          📍 Enter Ambulance Address / Landmark
+        </label>
+        <div style="display:flex; gap:6px;">
+          <input type="text" id="amb-address-input" placeholder="e.g. NH-19 Highway Corridor, Mathura" style="flex:1; background:#0f172a; border:1px solid #334155; border-radius:6px; padding:8px 10px; color:#fff; font-size:0.85rem;" value="K.D. Medical College & Apex Trauma Hub">
+          <button id="btn-update-address" class="btn-sm" style="background:#0284c7; color:#fff; font-weight:700; border:none; padding:0 12px; border-radius:6px; cursor:pointer;" title="Resolve address and track ambulance">
+            Track
+          </button>
+        </div>
+        <div class="quick-addresses" style="display:flex; gap:4px; flex-wrap:wrap; margin-top:6px;">
+          <button type="button" class="addr-chip" data-addr="K.D. Medical College Campus, Mathura" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); font-size:0.7rem; border-radius:4px; padding:2px 6px; cursor:pointer;">KD Campus</button>
+          <button type="button" class="addr-chip" data-addr="NH-19 Highway Corridor Mile 42" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); font-size:0.7rem; border-radius:4px; padding:2px 6px; cursor:pointer;">NH-19 Highway</button>
+          <button type="button" class="addr-chip" data-addr="Nayati Medicity Sector Corridor" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); font-size:0.7rem; border-radius:4px; padding:2px 6px; cursor:pointer;">Nayati Medicity</button>
+          <button type="button" class="addr-chip" data-addr="Mathura Combined District Center" style="background:rgba(59,130,246,0.15); color:#93c5fd; border:1px solid rgba(59,130,246,0.3); font-size:0.7rem; border-radius:4px; padding:2px 6px; cursor:pointer;">District Hospital</button>
+        </div>
+      </div>
+
+      <div class="status-card" id="gps-status-card">
+        <span class="status-dot tracking" id="gps-dot"></span>
+        <span id="gps-status-text" class="status-text">Fleet Telemetry Online</span>
+      </div>
+
+      <!-- Complex Geospatial & Geodetic Telemetry Engine (Advanced Telemetry Matrix) -->
+      <div class="complex-telemetry-panel" style="background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:10px; margin-bottom:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <span style="font-size:0.72rem; color:#38bdf8; font-family:'JetBrains Mono',monospace; font-weight:700;">📡 GEODETIC TELEMETRY MATRIX</span>
+          <span style="font-size:0.68rem; color:#34d399; background:rgba(16,185,129,0.15); padding:1px 6px; border-radius:3px;">LOCK: DGPS-RTK</span>
+        </div>
+        <div class="grid-2col" style="gap:6px; font-family:'JetBrains Mono',monospace; font-size:0.75rem;">
+          <div style="background:#1e293b; padding:4px 8px; border-radius:4px;">
+            <div style="color:#64748b; font-size:0.65rem;">UTM / MGRS GRID</div>
+            <div style="color:#f8fafc;" id="telemetry-utm">43R FL 5821 5932</div>
+          </div>
+          <div style="background:#1e293b; padding:4px 8px; border-radius:4px;">
+            <div style="color:#64748b; font-size:0.65rem;">GEOHASH / ELLIPSOID</div>
+            <div style="color:#f8fafc;" id="telemetry-geohash">tsp0qu8 • WGS84</div>
+          </div>
+          <div style="background:#1e293b; padding:4px 8px; border-radius:4px;">
+            <div style="color:#64748b; font-size:0.65rem;">PRECISION HDOP / PDOP</div>
+            <div style="color:#34d399;" id="telemetry-dop">0.82 (Sub-meter Fix)</div>
+          </div>
+          <div style="background:#1e293b; padding:4px 8px; border-radius:4px;">
+            <div style="color:#64748b; font-size:0.65rem;">GEODESIC RESOLVER</div>
+            <div style="color:#93c5fd;" id="telemetry-coords">27°38'48.7"N 77°33'06.9"E</div>
+          </div>
+        </div>
+        <div style="margin-top:6px; display:flex; justify-content:space-between; font-size:0.7rem; color:#64748b;">
+          <span>Last Fix: <span id="gps-last-updated" style="color:#cbd5e1;">Just now</span></span>
+          <span>Constellation: <strong style="color:#38bdf8;">14 SVs Active</strong></span>
+        </div>
+      </div>
+
+      <!-- Emergency Trigger Card -->
+      <div class="emergency-box">
+        <div class="section-header" style="margin-bottom:8px;">
+          <h2>Emergency Action</h2>
+          <span class="priority-tag">CRITICAL</span>
+        </div>
+        
+        <div class="status-card" id="emergency-status-card">
+          <span class="status-dot offline" id="emergency-dot"></span>
+          <span id="emergency-status-text">Ready for Emergency Dispatch</span>
+        </div>
+
+        <button id="emergency-btn" class="btn-emergency">
+          🚨 <span>Emergency Patient Onboard</span>
+        </button>
+        <small class="hint-text">Locks active unit GPS, scores all 12+ hospitals &amp; calculates turn-by-turn road route</small>
+      </div>
+
+      <!-- Search Settings -->
+      <div class="section-header" style="margin-top:20px;">
+        <h2>Search Parameters</h2>
+      </div>
+      <div class="info-group">
+        <div class="range-header">
+          <label for="search-radius">Network Search Radius</label>
+          <span class="badge-val" id="radius-value">30 km</span>
+        </div>
+        <input type="range" id="search-radius" min="5" max="50" value="30" class="custom-range" />
+      </div>
+
+      <!-- Eligibility Filter -->
+      <div class="filter-card">
+        <label class="toggle-label">
+          <input type="checkbox" id="eligible-only-filter" />
+          <span class="toggle-custom"></span>
+          <span class="toggle-text">Show Eligible Hospitals Only</span>
+        </label>
+        <div class="filter-desc">Filters out hospitals with zero ICU/emergency beds or active rejections.</div>
+      </div>
+
+      <!-- Hospital List Section -->
+      <div class="section-header" style="margin-top:20px;">
+        <h2>Emergency Hospitals Network</h2>
+        <span class="count-badge" id="hospital-count-badge">0 Found</span>
+      </div>
+      <div id="hospital-list" class="hospital-list">
+        <div class="hospital-empty">
+          <div class="empty-icon">🏥</div>
+          <p>Press <strong>"Emergency Patient Onboard"</strong> above to scan all 12+ emergency hospitals.</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- CENTRE: MAP CONTAINER -->
+    <section class="map-container">
+      <div id="map"></div>
+      
+      <!-- Leaflet container when Google Maps is not used -->
+      <div id="leaflet-map" style="width:100%; height:100%; display:none;"></div>
+
+      <!-- Floating Map Notification / Toast -->
+      <div id="map-message" class="map-message hidden">
+        <p id="map-message-text"></p>
+      </div>
+
+      <!-- Map Control Overlays -->
+      <div class="map-overlay-controls">
+        <button id="recenter-map-btn" class="map-btn" title="Recenter on Active Ambulance">
+          🎯 Recenter Unit
+        </button>
+        <button id="fit-bounds-btn" class="map-btn" title="View all Hospitals & Fleet">
+          🌐 View Network
+        </button>
+      </div>
+    </section>
+
+    <!-- RIGHT PANEL: Selected Hospital & Navigation Details -->
+    <aside class="panel panel-right" id="panel-right">
+      <div class="section-header">
+        <h2>Hospital &amp; Route Telemetry</h2>
+      </div>
+      <div id="hospital-detail-content">
+        <div class="placeholder-container">
+          <div class="placeholder-icon">🧭</div>
+          <h3>No Hospital Selected</h3>
+          <p class="placeholder-text">
+            Select a hospital from the list to view real-time bed capacity, trauma doctors on duty, direct phone contacts, and road-snapped turn-by-turn navigation.
+          </p>
+        </div>
+      </div>
+    </aside>
+
+  </main>
+
+  <!-- ==================== MODALS & OVERLAYS ==================== -->
+  
+  <!-- Loading overlay for hospital search -->
+  <div id="hospital-loading-overlay" class="hidden">
+    <div class="loading-spinner">
+      <div class="spinner"></div>
+      <p id="loading-title">Scanning Emergency Hospital Network...</p>
+      <small id="loading-subtitle">Querying trauma wards, bed counts &amp; road navigation</small>
+    </div>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container"></div>
+
+  <!-- ==================== SCRIPTS ==================== -->
+
+  <!-- 1. Leaflet JS library (universal fallback map engine) -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+  <!-- 2. Application Config (loads API key or triggers smart simulation) -->
+  <script src="js/config.js"></script>
+
+  <!-- 3. Google Maps Loader with geometry & places libraries -->
+  <script>
+    (function () {
+      var hasRealGoogleKey = (
+        typeof GOOGLE_MAPS_API_KEY !== 'undefined' &&
+        GOOGLE_MAPS_API_KEY &&
+        GOOGLE_MAPS_API_KEY !== 'YOUR_GOOGLE_MAPS_API_KEY' &&
+        GOOGLE_MAPS_API_KEY.trim().length > 10
+      );
+
+      if (hasRealGoogleKey) {
+        var script = document.createElement('script');
+        script.src = 'https://maps.googleapis.com/maps/api/js?key=' +
+                     encodeURIComponent(GOOGLE_MAPS_API_KEY) +
+                     '&libraries=geometry,places&callback=initMap&v=weekly';
+        script.async = true;
+        script.defer = true;
+        script.onerror = function () {
+          console.warn('[Map Engine] Google Maps failed to load. Falling back to Leaflet/OpenStreetMap.');
+          window.__useLeafletFallback = true;
+          if (typeof initLeafletMap === 'function') {
+            initLeafletMap();
+          }
+        };
+        document.head.appendChild(script);
+      } else {
+        console.log('[Map Engine] Running with OpenStreetMap & Real Road Network engine.');
+        window.__useLeafletFallback = true;
+        window.addEventListener('DOMContentLoaded', function() {
+          setTimeout(function() {
+            if (typeof initLeafletMap === 'function') {
+              initLeafletMap();
+            }
+          }, 100);
+        });
+      }
+    })();
+  </script>
+
+  <!-- Socket.IO Real-Time Engine -->
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
+  <!-- 4. Map rendering and adapter (supports both Google Maps and Leaflet) -->
+  <script src="js/map.js"></script>
+
+  <!-- 5. Multi-Ambulance GPS tracking & Fleet Manager -->
+  <script src="js/location.js"></script>
+
+  <!-- 6. Hospital Search & Places fallback service -->
+  <script src="js/hospitals.js"></script>
+
+  <!-- 7. Hospital eligibility service & filtering -->
+  <script src="js/hospital_service.js"></script>
+
+  <!-- 8. Route calculation via Routes API / OSRM -->
+  <script src="js/routes.js"></script>
+
+  <!-- 9. Dynamic traffic monitoring -->
+  <script src="js/dynamic_routes.js"></script>
+
+  <!-- 10. Dashboard UI logic -->
+  <script src="js/dashboard.js"></script>
+
+</body>
+</html>
