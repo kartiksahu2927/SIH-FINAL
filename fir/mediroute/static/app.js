@@ -1496,10 +1496,13 @@ function table(rows, columns) {
 
 function renderMapFrame(type = 'ambulance', title = '') {
   const isHospital = type === 'hospital';
-  const ambSrc = '/map-live/index.html';
-  const hospSrc = '/map-live/hospital.html';
+
+  const mapBaseUrl = 'https://YOUR-MAP-RENDER-URL.onrender.com';
+
+  const ambSrc = `${mapBaseUrl}/`;
+  const hospSrc = `${mapBaseUrl}/hospital`;
+
   const currentSrc = isHospital ? hospSrc : ambSrc;
-  const frameId = 'map-iframe-elem';
 
   return `
     <article class="card map-frame-card" style="margin: 16px 0; border: 2px solid #087f76; box-shadow: 0 8px 24px rgba(8,127,118,0.12); overflow: hidden; border-radius: 12px; background: #fff;">
