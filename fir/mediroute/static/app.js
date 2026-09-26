@@ -1493,11 +1493,11 @@ function table(rows, columns) {
       </table>
     </div>` : `<p class="muted">${escapeHtml(t('no_records', 'No records yet.'))}</p>`;
 }
-
 function renderMapFrame(type = 'ambulance', title = '') {
   const isHospital = type === 'hospital';
+  const frameId = 'map-iframe-elem';
 
-  const mapBaseUrl = 'https://YOUR-MAP-RENDER-URL.onrender.com';
+  const mapBaseUrl = 'https://sih-final-5-yxht.onrender.com';
 
   const ambSrc = `${mapBaseUrl}/`;
   const hospSrc = `${mapBaseUrl}/hospital`;
