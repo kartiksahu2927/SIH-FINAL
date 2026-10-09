@@ -1497,7 +1497,7 @@ function renderMapFrame(type = 'ambulance', title = '') {
   const isHospital = type === 'hospital';
   const frameId = 'map-iframe-elem';
 
-  const mapBaseUrl = 'https://sih-final-5-yxht.onrender.com';
+  const mapBaseUrl = 'https://mediroute-map.onrender.com/';
 
   const ambSrc = `${mapBaseUrl}/`;
   const hospSrc = `${mapBaseUrl}/hospital`;
