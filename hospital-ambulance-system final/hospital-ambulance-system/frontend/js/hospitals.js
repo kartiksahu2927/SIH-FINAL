@@ -11,15 +11,20 @@ const HospitalSearch = {
   SEARCH_RADIUS_METERS: 30000, // 30 km default coverage
   MAX_RESULTS: 20,
   isSearching: false,
+  searchToken: 0,
   lastResults: [],
   lastCenter: null,
 
   async searchNearbyHospitals(lat, lng, radius = this.SEARCH_RADIUS_METERS) {
-    if (this.isSearching) return this.lastResults;
+    const validLat = typeof lat === 'number' && Number.isFinite(lat) ? lat : null;
+    const validLng = typeof lng === 'number' && Number.isFinite(lng) ? lng : null;
+    if (validLat === null || validLng === null || Math.abs(validLat) > 90 || Math.abs(validLng) > 180) {
+      this._showError('Select a current GPS position or explicitly selected coordinates before searching.');
+      this.lastResults = [];
+      return [];
+    }
 
-    const validLat = typeof lat === 'number' && !isNaN(lat) ? lat : 28.6139;
-    const validLng = typeof lng === 'number' && !isNaN(lng) ? lng : 77.2090;
-
+    const searchToken = ++this.searchToken;
     this.isSearching = true;
     this.lastCenter = { lat: validLat, lng: validLng };
     this._showLoading(true);
@@ -44,7 +49,10 @@ const HospitalSearch = {
         results = await this._callBackendAPI(validLat, validLng, radius / 1000);
       }
 
-      // Merge with latest live telemetry store
+      if (searchToken !== this.searchToken) return [];
+
+      // Merge with latest published telemetry when it exists. OSM discovery
+      // records remain UNKNOWN when no hospital capacity feed is available.
       if (window.HospitalService) {
         results.forEach(h => {
           const elig = window.HospitalService.getEligibility(h.place_id);
@@ -63,8 +71,10 @@ const HospitalSearch = {
       this._showError('Search failed: ' + err.message);
       return [];
     } finally {
-      this.isSearching = false;
-      this._showLoading(false);
+      if (searchToken === this.searchToken) {
+        this.isSearching = false;
+        this._showLoading(false);
+      }
     }
   },
 

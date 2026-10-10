@@ -1,10 +1,10 @@
 import os
 import math
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from .models import Ambulance, AmbulanceDriver, Doctor, EmergencyGuidance, Hospital, Medicine, MedicineInventory, PatientProfile, PolicySetting, User
+from .models import Ambulance, AmbulanceDriver, Doctor, EmergencyGuidance, Hospital, Medicine, MedicineInventory, Notification, NotificationPreference, PatientProfile, PolicySetting, User
 from .security import hash_password
 
 
@@ -82,33 +82,14 @@ def seed_demo_data(db: Session) -> None:
         ])
         db.add(PolicySetting(key="quality_thresholds", value={"minimum_ratings": 3, "low_rating_percentage": 40, "complaint_count": 3, "review_period_days": 30}))
 
-    ks_hospital = db.scalar(select(Hospital).where(Hospital.map_place_id == "KS001"))
-    if not ks_hospital:
-        ks_hospital = Hospital(
-            name="KS Hospital - Emergency Center (Demo)",
-            address="MediRoute controlled demo location, Mathura, Uttar Pradesh",
-            phone="1800-108-2027",
-            latitude=coordinate("DEMO_KS_HOSPITAL_LAT", 27.6182, 90),
-            longitude=coordinate("DEMO_KS_HOSPITAL_LNG", 77.6014, 180),
-            emergency_capacity=18,
-            emergency_available=8,
-            beds_available=18,
-            doctors_available=5,
-            services=["emergency", "trauma", "diagnostics"],
-            map_place_id="KS001",
-            demo_facility=True,
-            capabilities_source="DEMO_CONFIG",
-            location_source="DEMO_CONFIG",
-        )
-        db.add(ks_hospital)
-        db.flush()
-    else:
-        ks_hospital.demo_facility = True
-        ks_hospital.capabilities_source = ks_hospital.capabilities_source or "DEMO_CONFIG"
-        ks_hospital.location_source = ks_hospital.location_source or "DEMO_CONFIG"
-
-    if not db.scalar(select(User.id).where(User.email == "ks-hospital@mediroute.demo")):
-        db.add(User(email="ks-hospital@mediroute.demo", password_hash=hash_password(DEMO_PASSWORD), full_name="KS Hospital Demo Team", role="HOSPITAL", hospital_id=ks_hospital.id, language="en"))
+    # KS Hospital is implemented by the map module's copy of the JS Hospital
+    # reception dashboard. Remove the previous FastAPI-only role account if an
+    # older database was initialized with it; do not create it again.
+    old_ks_user = db.scalar(select(User).where(User.email == "ks-hospital@mediroute.demo"))
+    if old_ks_user:
+        db.execute(delete(Notification).where(Notification.user_id == old_ks_user.id))
+        db.execute(delete(NotificationPreference).where(NotificationPreference.user_id == old_ks_user.id))
+        db.delete(old_ks_user)
     # Existing MediRoute facilities already had configured coordinates before
     # source metadata existed. Label those values transparently; this does not
     # claim live capacity or move a facility. Unknown capacity is confirmed by

@@ -12,6 +12,7 @@ const Dashboard = {
   emergencyActive: false,
   selectedHospital: null,
   searchRadiusKm: 30,
+  acceptedHospitalResponses: {},
 
   init() {
     this._bindEvents();
@@ -44,14 +45,12 @@ const Dashboard = {
         // 1. Dedicated Accepted Event
         this.socket.on('emergency_request_accepted', (data) => {
           console.log('[Socket.IO] ✅ Hospital ACCEPTED request:', data);
-          this._stopEmergencyStatusWatcher();
           this._onHospitalAccepted(data);
         });
 
         // 2. Dedicated Rejected Event
         this.socket.on('emergency_request_rejected', (data) => {
           console.log('[Socket.IO] ❌ Hospital REJECTED request:', data);
-          this._stopEmergencyStatusWatcher();
           this._onHospitalRejected(data);
         });
 
@@ -72,7 +71,6 @@ const Dashboard = {
           console.log('[Socket.IO] 🔄 Emergency Status Update:', data);
           const status = String(data?.status || '').toUpperCase();
           if (status === 'ACCEPTED') {
-            this._stopEmergencyStatusWatcher();
             this._onHospitalAccepted(data);
           } else if (status === 'REJECTED') {
             this._stopEmergencyStatusWatcher();
@@ -124,13 +122,14 @@ const Dashboard = {
   },
 
   _onHospitalAccepted(data, isSync = false) {
-    this._stopEmergencyStatusWatcher();
-    const hospName = data.hospital_name || 'JS Hospital - Demo Hospital';
-    const hospId = data.hospital_id || 'JS001';
+    const hospId = data.response_hospital_id || data.hospital_id || 'JS001';
+    const target = (data.hospital_targets || []).find(item => item.hospital_id === hospId);
+    const hospName = data.response_hospital_name || target?.hospital_name || data.hospital_name || hospId;
+    this.acceptedHospitalResponses[hospId] = data.response_status || 'ACCEPTED';
 
     if (!isSync) {
       this._playAudioAlert(true);
-      this._showToast(`✅ ${hospName} ACCEPTED the emergency request! Road route locked.`, 'success');
+      this._showToast(`✅ ${hospName} ACCEPTED the emergency request.`, 'success');
     }
 
     const emergBtn = document.getElementById('emergency-btn');
@@ -142,20 +141,26 @@ const Dashboard = {
 
     this._setEmergencyStatus('accepted');
 
-    // Auto-select JS Hospital on map and calculate real road route
+    // Select the hospital that actually accepted; JS001 remains the legacy default.
     this.selectHospital(hospId);
   },
 
   _onHospitalRejected(data) {
-    this._stopEmergencyStatusWatcher();
-    const hospName = data.hospital_name || 'JS Hospital - Demo Hospital';
+    const hospId = data.response_hospital_id || data.hospital_id || 'JS001';
+    const target = (data.hospital_targets || []).find(item => item.hospital_id === hospId);
+    const hospName = data.response_hospital_name || target?.hospital_name || data.hospital_name || hospId;
     const reason = data.rejection_reason || 'Department at maximum capacity';
 
     this._playAudioAlert(false);
     this._showToast(`❌ ${hospName} rejected the emergency request (${reason}). Please select an alternate facility.`, 'error');
 
-    this._resetEmergencyButton();
-    this._setEmergencyStatus('rejected');
+    const responses = Object.values(data.hospital_responses || {});
+    const anyPending = responses.some(item => item.status === 'PENDING');
+    const anyAccepted = responses.some(item => item.status === 'ACCEPTED');
+    if (!anyPending && !anyAccepted) {
+      this._resetEmergencyButton();
+      this._setEmergencyStatus('rejected');
+    }
   },
 
   _playAudioAlert(isSuccess) {
@@ -257,12 +262,28 @@ const Dashboard = {
     }
   },
 
+  clearNearbyResults(message = 'Select a current GPS position or explicit coordinates to search nearby hospitals.') {
+    this.lastNearbyError = message;
+    this._renderHospitalList([]);
+    this._setEmergencyStatus('ready');
+    const container = document.getElementById('hospital-list');
+    if (container) {
+      container.innerHTML = `<div class="hospital-empty"><div class="empty-icon">📍</div><p>${message}</p></div>`;
+    }
+  },
+
   async recalculateDistancesAndRoute() {
-    const active = window.LocationTracker?.getActiveUnit() || { lat: 27.646870, lng: 77.551921 };
+    let position;
+    try {
+      position = await window.LocationTracker.getCurrentPosition();
+    } catch (error) {
+      this.clearNearbyResults(error.message);
+      return [];
+    }
     const radiusMeters = this.searchRadiusKm * 1000;
     
     const hospitals = await window.HospitalSearch.searchNearbyHospitals(
-      active.lat, active.lng, radiusMeters
+      position.lat, position.lng, radiusMeters
     );
 
     this._renderHospitalList(hospitals);
@@ -400,7 +421,10 @@ const Dashboard = {
 
       position = await window.LocationTracker.getCurrentPosition();
     } catch (err) {
-      position = { lat: 27.646870, lng: 77.551921 };
+      this._showToast(err.message, 'warning');
+      this._setEmergencyStatus('ready');
+      this._resetEmergencyButton();
+      return;
     }
 
     try {
@@ -426,13 +450,14 @@ const Dashboard = {
         window.showHospitalMarkers(hospitals);
       }
 
-      // Priority Target: JS Hospital - Demo Hospital (SIH 2-Device Demo)
+      // Keep the JS/KS reception workflow as the emergency target while the
+      // nearby list itself remains composed only of real discovered hospitals.
       const jsHospital = hospitals.find(h => h.place_id === 'JS001' || h.hospital_id === 'JS001') || hospitals[0];
       const activeUnit = window.LocationTracker?.getActiveUnit() || { id: 'AMB-101', callsign: 'Unit 101 (ALS)' };
 
       // Calculate real route & ETA to JS Hospital
-      let distanceKm = 1.45;
-      let etaMin = 4;
+      let distanceKm = null;
+      let etaMin = null;
       try {
         const routeData = await window.RouteCalculator.calculateRoute(
           { lat: position.lat, lng: position.lng },
@@ -442,7 +467,9 @@ const Dashboard = {
           distanceKm = routeData.distance_km;
           etaMin = routeData.duration_min;
         }
-      } catch (e) {}
+      } catch (e) {
+        console.warn('[Dashboard] Road route unavailable; backend will calculate dispatch routing.', e.message);
+      }
 
       // Real-Time Dispatch Payload
       const requestPayload = {
@@ -570,17 +597,17 @@ const Dashboard = {
       const isSelected = this.selectedHospital?.place_id === h.place_id;
       const eligibility = window.HospitalService?.getEligibilityStatus(h);
       const isEligible = eligibility?.eligible !== false;
-      const divert = h.divert_status || 'OPEN';
+       const divert = h.divert_status || null;
 
       // Occupancy Progress Meter calculation
-      const erAvail = h.emergency_beds_available ?? (h.emergency_bed_available ? 5 : 0);
-      const erTot = h.emergency_beds_total ?? 20;
-      const icuAvail = h.icu_beds_available ?? (h.icu_available ? 3 : 0);
-      const icuTot = h.icu_beds_total ?? 8;
-      const occupancy = h.occupancy_pct ?? Math.round(((erTot - erAvail) / erTot) * 100);
+       const erAvail = Number.isFinite(h.emergency_beds_available) ? h.emergency_beds_available : null;
+       const erTot = Number.isFinite(h.emergency_beds_total) ? h.emergency_beds_total : null;
+       const icuAvail = Number.isFinite(h.icu_beds_available) ? h.icu_beds_available : null;
+       const icuTot = Number.isFinite(h.icu_beds_total) ? h.icu_beds_total : null;
+       const occupancy = Number.isFinite(h.occupancy_pct) ? h.occupancy_pct : null;
       
-      const occColor = occupancy >= 90 ? 'var(--emergency)' : occupancy >= 75 ? 'var(--warning)' : 'var(--success)';
-      const divertTag = divert === 'FULL_DIVERT' ? '<span class="status-tag-divert">FULL DIVERT</span>'
+       const occColor = occupancy == null ? '#64748b' : occupancy >= 90 ? 'var(--emergency)' : occupancy >= 75 ? 'var(--warning)' : 'var(--success)';
+       const divertTag = !h.divert_status ? '<span class="status-tag-busy">STATUS UNKNOWN</span>' : divert === 'FULL_DIVERT' ? '<span class="status-tag-divert">FULL DIVERT</span>'
         : divert === 'HEAVY_LOAD' ? '<span class="status-tag-busy">HEAVY LOAD</span>'
         : '<span class="status-tag-open">READY / OPEN</span>';
 
@@ -592,50 +619,50 @@ const Dashboard = {
             <span class="hospital-rank">${index + 1}</span>
             <div class="hospital-name-box">
               <span class="hospital-name" title="${this._escapeHtml(h.name)}">${this._escapeHtml(h.name)}</span>
-              <span class="live-stream-badge"><span class="live-pulse-dot"></span> LIVE</span>
+             <span class="live-stream-badge"><span class="live-pulse-dot"></span> ${h.source === 'OpenStreetMap Overpass' ? 'DISCOVERED' : 'LIVE'}</span>
             </div>
             ${divertTag}
           </div>
           
           <div class="hospital-meta">
             <span class="hospital-distance">📍 ${h.distance_km ? h.distance_km.toFixed(1) : '--'} km</span>
-            <span class="hospital-eta">⏱ ${h.duration_text || '--'}</span>
-            <span class="hospital-wait">⏳ Triage: ${h.er_wait_time_minutes ?? 0}m</span>
-            <span class="hospital-rating">⭐ ${h.rating || '4.5'}</span>
+             <span class="hospital-eta">⏱ ${h.duration_text || 'Not calculated'}</span>
+             <span class="hospital-wait">⏳ Triage: ${h.er_wait_time_minutes ?? 'Unknown'}</span>
+             <span class="hospital-rating">⭐ ${h.rating ?? 'Not published'}</span>
           </div>
 
           <!-- Live Bed Capacity Bar -->
           <div class="live-capacity-container">
             <div class="live-capacity-header">
               <span class="capacity-label">Trauma Ward Occupancy</span>
-              <span class="capacity-val" style="color:${occColor}; font-weight:700;">${occupancy}% (${erAvail} Beds Free)</span>
+               <span class="capacity-val" style="color:${occColor}; font-weight:700;">${occupancy == null ? 'Not published' : `${occupancy}% (${erAvail} Beds Free)`}</span>
             </div>
             <div class="capacity-progress-track">
-              <div class="capacity-progress-fill" style="width: ${occupancy}%; background: ${occColor};"></div>
+               <div class="capacity-progress-fill" style="width: ${occupancy ?? 0}%; background: ${occColor};"></div>
             </div>
           </div>
 
           <!-- Live Telemetry Badges Grid -->
           <div class="hospital-live-chips">
-            <div class="live-chip ${erAvail > 0 ? 'chip-green' : 'chip-red'}">
+             <div class="live-chip ${erAvail == null ? 'chip-amber' : erAvail > 0 ? 'chip-green' : 'chip-red'}">
               <span class="chip-icon">🛏️</span>
               <span class="chip-label">ER:</span>
-              <strong>${erAvail}/${erTot}</strong>
+               <strong>${erAvail == null ? '--' : `${erAvail}/${erTot}`}</strong>
             </div>
-            <div class="live-chip ${icuAvail > 0 ? 'chip-green' : 'chip-red'}">
+             <div class="live-chip ${icuAvail == null ? 'chip-amber' : icuAvail > 0 ? 'chip-green' : 'chip-red'}">
               <span class="chip-icon">🫁</span>
               <span class="chip-label">ICU:</span>
-              <strong>${icuAvail}/${icuTot}</strong>
+               <strong>${icuAvail == null ? '--' : `${icuAvail}/${icuTot}`}</strong>
             </div>
-            <div class="live-chip ${h.doctor_available ? 'chip-green' : 'chip-red'}">
+             <div class="live-chip ${h.doctor_available == null ? 'chip-amber' : h.doctor_available ? 'chip-green' : 'chip-red'}">
               <span class="chip-icon">👨‍⚕️</span>
               <span class="chip-label">Trauma Dr:</span>
-              <strong>${h.doctor_available ? 'On Duty' : 'Off'}</strong>
+               <strong>${h.doctor_available == null ? 'Unknown' : h.doctor_available ? 'On Duty' : 'Off'}</strong>
             </div>
-            <div class="live-chip ${h.oxygen_level_pct >= 90 ? 'chip-green' : 'chip-amber'}">
+             <div class="live-chip ${h.oxygen_level_pct == null ? 'chip-amber' : h.oxygen_level_pct >= 90 ? 'chip-green' : 'chip-amber'}">
               <span class="chip-icon">💨</span>
               <span class="chip-label">O2:</span>
-              <strong>${h.oxygen_level_pct ?? 95}%</strong>
+               <strong>${h.oxygen_level_pct == null ? 'Unknown' : `${h.oxygen_level_pct}%`}</strong>
             </div>
           </div>
 
@@ -695,28 +722,6 @@ const Dashboard = {
         this._renderHospitalList(window.HospitalSearch.lastResults);
       }
     }
-    if (!hospital && placeId === 'HOSP_KD_MEDICAL') {
-      hospital = {
-        place_id: "HOSP_KD_MEDICAL",
-        name: "K.D. Medical College Hospital & Research Center (Apex Trauma Center)",
-        latitude: 27.646870,
-        longitude: 77.551921,
-        address: "National Highway 44, PO-Chhatikara, Akbarpur, Mathura, Uttar Pradesh 281406",
-        phone: "+91 5662 281 100",
-        rating: 4.8,
-        emergency_beds_available: 14,
-        icu_beds_available: 5,
-        doctor_available: true,
-        emergency_bed_available: true,
-        icu_available: true,
-        required_facility_available: true,
-        divert_status: "OPEN"
-      };
-      if (window.HospitalSearch?.lastResults) {
-        window.HospitalSearch.lastResults.unshift(hospital);
-        this._renderHospitalList(window.HospitalSearch.lastResults);
-      }
-    }
     if (!hospital) {
       console.warn('[Dashboard] Hospital not found with place_id:', placeId);
       return;
@@ -756,10 +761,13 @@ const Dashboard = {
   async calculateRouteToSelected() {
     if (!this.selectedHospital) return;
 
-    const active = window.LocationTracker?.getActiveUnit();
-    const origin = (active && active.lat && active.lng)
-      ? { lat: Number(active.lat), lng: Number(active.lng) }
-      : (window.ambulancePosition || { lat: 27.646870, lng: 77.551921 });
+    let origin;
+    try {
+      origin = await window.LocationTracker.getCurrentPosition();
+    } catch (error) {
+      this._showToast(error.message, 'warning');
+      return;
+    }
 
     const destination = {
       lat: Number(this.selectedHospital.latitude),

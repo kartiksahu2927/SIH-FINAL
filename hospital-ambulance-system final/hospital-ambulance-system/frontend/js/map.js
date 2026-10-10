@@ -258,39 +258,40 @@ function showHospitalMarkers(hospitals) {
     const lat = Number(hospital.latitude);
     const lng = Number(hospital.longitude);
     const rank = index + 1;
-    const erAvail = hospital.emergency_beds_available ?? (hospital.emergency_bed_available ? 5 : 0);
-    const erTot = hospital.emergency_beds_total ?? 20;
-    const icuAvail = hospital.icu_beds_available ?? (hospital.icu_available ? 3 : 0);
-    const icuTot = hospital.icu_beds_total ?? 8;
-    const divert = hospital.divert_status || 'OPEN';
-    const divertColor = divert === 'FULL_DIVERT' ? '#dc2626' : divert === 'HEAVY_LOAD' ? '#d97706' : '#16a34a';
+    const erAvail = Number.isFinite(hospital.emergency_beds_available) ? hospital.emergency_beds_available : null;
+    const erTot = Number.isFinite(hospital.emergency_beds_total) ? hospital.emergency_beds_total : null;
+    const icuAvail = Number.isFinite(hospital.icu_beds_available) ? hospital.icu_beds_available : null;
+    const icuTot = Number.isFinite(hospital.icu_beds_total) ? hospital.icu_beds_total : null;
+    const divert = hospital.divert_status || null;
+    const divertLabel = divert || 'STATUS UNKNOWN';
+    const divertColor = !divert ? '#64748b' : divert === 'FULL_DIVERT' ? '#dc2626' : divert === 'HEAVY_LOAD' ? '#d97706' : '#16a34a';
 
     const popupHtml = `
       <div style="font-family:sans-serif; min-width:240px; padding:4px;">
         <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:4px;">
           <strong style="color:#1976d2; font-size:14px;">🏥 ${escapeHtml(hospital.name)}</strong>
-          <span style="font-size:10px; font-weight:700; background:${divertColor}20; color:${divertColor}; padding:2px 6px; border-radius:4px;">${divert}</span>
+           <span style="font-size:10px; font-weight:700; background:${divertColor}20; color:${divertColor}; padding:2px 6px; border-radius:4px;">${divertLabel}</span>
         </div>
         <div style="font-size:11px; color:#555; margin-bottom:6px;">${escapeHtml(hospital.address || '')}</div>
         
         <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:6px; margin-bottom:6px; font-size:11px;">
           <div style="display:flex; justify-content:space-between; margin-bottom:2px;">
             <span>🛏️ <strong>ER Beds:</strong></span>
-            <strong style="color:${erAvail > 0 ? '#16a34a' : '#dc2626'}">${erAvail} / ${erTot} Free</strong>
+           <strong style="color:${erAvail == null ? '#64748b' : erAvail > 0 ? '#16a34a' : '#dc2626'}">${erAvail == null ? 'Not published' : `${erAvail} / ${erTot} Free`}</strong>
           </div>
           <div style="display:flex; justify-content:space-between; margin-bottom:2px;">
             <span>🫁 <strong>ICU Beds:</strong></span>
-            <strong style="color:${icuAvail > 0 ? '#16a34a' : '#dc2626'}">${icuAvail} / ${icuTot} Free</strong>
+             <strong style="color:${icuAvail == null ? '#64748b' : icuAvail > 0 ? '#16a34a' : '#dc2626'}">${icuAvail == null ? 'Not published' : `${icuAvail} / ${icuTot} Free`}</strong>
           </div>
           <div style="display:flex; justify-content:space-between;">
             <span>⏳ <strong>Triage Wait:</strong></span>
-            <strong style="color:#2563eb">${hospital.er_wait_time_minutes ?? 0} min</strong>
+             <strong style="color:#2563eb">${hospital.er_wait_time_minutes ?? 'Unknown'} min</strong>
           </div>
         </div>
 
         <div style="display:flex; justify-content:space-between; font-size:12px; font-weight:600; margin-bottom:6px;">
           <span style="color:#1565c0;">📍 ${hospital.distance_km ? hospital.distance_km.toFixed(1) : '--'} km</span>
-          <span style="color:#ef6c00;">⏱ ${hospital.duration_text || '--'}</span>
+           <span style="color:#ef6c00;">⏱ ${hospital.duration_text || 'Not calculated'}</span>
         </div>
         <button onclick="if(window.Dashboard) window.Dashboard.selectHospital('${hospital.place_id}')" 
                 style="width:100%; padding:6px; background:#1976d2; color:#fff; border:none; border-radius:4px; font-size:12px; cursor:pointer; font-weight:600;">
@@ -540,37 +541,36 @@ function showHospitalDetails(hospital) {
   const container = document.getElementById('hospital-detail-content');
   if (!container || !hospital) return;
 
-  const erAvail = hospital.emergency_beds_available ?? (hospital.emergency_bed_available ? 5 : 0);
-  const erTot = hospital.emergency_beds_total ?? 20;
-  const icuAvail = hospital.icu_beds_available ?? (hospital.icu_available ? 3 : 0);
-  const icuTot = hospital.icu_beds_total ?? 8;
-  const vAvail = hospital.ventilators_available ?? 3;
-  const vTot = hospital.ventilators_total ?? 8;
-  const o2Pct = hospital.oxygen_level_pct ?? 96;
-  const o2Hours = hospital.oxygen_hours_remaining ?? 60;
-  const occupancy = hospital.occupancy_pct ?? Math.round(((erTot - erAvail) / erTot) * 100);
-  const divert = hospital.divert_status || 'OPEN';
+    const erAvail = Number.isFinite(hospital.emergency_beds_available) ? hospital.emergency_beds_available : null;
+    const erTot = Number.isFinite(hospital.emergency_beds_total) ? hospital.emergency_beds_total : null;
+    const icuAvail = Number.isFinite(hospital.icu_beds_available) ? hospital.icu_beds_available : null;
+    const icuTot = Number.isFinite(hospital.icu_beds_total) ? hospital.icu_beds_total : null;
+    const vAvail = Number.isFinite(hospital.ventilators_available) ? hospital.ventilators_available : null;
+    const vTot = Number.isFinite(hospital.ventilators_total) ? hospital.ventilators_total : null;
+    const o2Pct = Number.isFinite(hospital.oxygen_level_pct) ? hospital.oxygen_level_pct : null;
+    const o2Hours = Number.isFinite(hospital.oxygen_hours_remaining) ? hospital.oxygen_hours_remaining : null;
+    const occupancy = Number.isFinite(hospital.occupancy_pct) ? hospital.occupancy_pct : null;
+    const icuLoad = icuAvail != null && icuTot ? Math.round(((icuTot - icuAvail) / icuTot) * 100) : 0;
+    const ventilatorLoad = vAvail != null && vTot ? Math.round(((vTot - vAvail) / vTot) * 100) : 0;
+    const divert = hospital.divert_status || null;
+    const hasManagedTelemetry = hospital.source !== 'OpenStreetMap Overpass';
 
-  const specs = hospital.specialists_on_duty || {
-    trauma_surgeon: true,
-    cardiologist: true,
-    neurologist: true,
-    anesthesiologist: true,
-    orthopedic_surgeon: true
-  };
+    const specs = hospital.specialists_on_duty || {};
 
-  const blood = hospital.blood_bank || { O_neg: 4, O_pos: 12, A_pos: 8, B_pos: 10, AB_pos: 5 };
-  const facilities = hospital.critical_facilities || {
-    cath_lab_active: true,
-    ct_scanner_ready: true,
-    trauma_bay_ready: true,
-    burn_unit_ready: false
-  };
+    const blood = hospital.blood_bank || {};
+    const facilities = hospital.critical_facilities || {};
 
-  const occColor = occupancy >= 90 ? 'var(--emergency)' : occupancy >= 75 ? 'var(--warning)' : 'var(--success)';
-  const divertTag = divert === 'FULL_DIVERT' ? '<span class="detail-divert-badge full">🚨 FULL DIVERSION</span>'
-    : divert === 'HEAVY_LOAD' ? '<span class="detail-divert-badge heavy">⚠️ HEAVY EMERGENCY LOAD</span>'
-    : '<span class="detail-divert-badge open">🟢 READY &amp; ACCEPTING PATIENTS</span>';
+    const occColor = occupancy == null ? '#64748b' : occupancy >= 90 ? 'var(--emergency)' : occupancy >= 75 ? 'var(--warning)' : 'var(--success)';
+    const divertTag = !divert ? '<span class="detail-divert-badge heavy">❔ STATUS NOT PUBLISHED</span>' : divert === 'FULL_DIVERT' ? '<span class="detail-divert-badge full">🚨 FULL DIVERSION</span>'
+      : divert === 'HEAVY_LOAD' ? '<span class="detail-divert-badge heavy">⚠️ HEAVY EMERGENCY LOAD</span>'
+      : '<span class="detail-divert-badge open">🟢 READY &amp; ACCEPTING PATIENTS</span>';
+    const operationalActions = hasManagedTelemetry ? `
+      <button class="btn-action-sm" onclick="window.HospitalService.simulateAdmissionForSelected()">
+        🚨 Simulate Patient Check-in (-1 ER Bed)
+      </button>
+      <button class="btn-action-sm" onclick="window.HospitalService.toggleHospitalDivertStatus('${hospital.place_id}')">
+        🔄 Toggle Divert Status
+      </button>` : '<span class="telemetry-note">Operational capacity is not published by the map provider.</span>';
 
   container.innerHTML = `
     <div class="selected-hospital-card">
@@ -584,7 +584,7 @@ function showHospitalDetails(hospital) {
         <div class="hospital-address-text">📍 ${escapeHtml(hospital.address || 'Address on record')}</div>
         <div class="telemetry-live-heartbeat">
           <span class="pulse-indicator"></span>
-          <span>Live Feed: ${escapeHtml(hospital.telemetry_source || 'HL7 FHIR Live Gateway')}</span>
+           <span>Source: ${escapeHtml(hospital.telemetry_source || hospital.source || 'Not published')}</span>
         </div>
       </div>
 
@@ -600,11 +600,11 @@ function showHospitalDetails(hospital) {
         </div>
         <div class="metric-box">
           <span class="metric-label">Triage Red Queue</span>
-          <span class="metric-val" style="color:#16a34a;">${hospital.er_wait_time_minutes ?? 0} min wait</span>
+           <span class="metric-val" style="color:#16a34a;">${hospital.er_wait_time_minutes ?? 'Unknown'} min wait</span>
         </div>
         <div class="metric-box">
           <span class="metric-label">Hospital Rating</span>
-          <span class="metric-val" style="color:#ca8a04;">⭐ ${hospital.rating || '4.5'}</span>
+           <span class="metric-val" style="color:#ca8a04;">⭐ ${hospital.rating ?? 'Not published'}</span>
         </div>
       </div>
 
@@ -613,7 +613,7 @@ function showHospitalDetails(hospital) {
         <div class="section-title-row">
           <h4>🛏️ Live Capacity Telemetry</h4>
           <span class="occupancy-pill" style="background:${occColor}20; color:${occColor}; font-weight:700;">
-            ${occupancy}% Ward Load
+             ${occupancy == null ? 'Not published' : `${occupancy}% Ward Load`}
           </span>
         </div>
 
@@ -622,10 +622,10 @@ function showHospitalDetails(hospital) {
           <div class="meter-card">
             <div class="meter-label-row">
               <span>Emergency Beds</span>
-              <strong style="color:${erAvail > 0 ? '#16a34a' : '#dc2626'}">${erAvail} / ${erTot} Free</strong>
+             <strong style="color:${erAvail == null ? '#64748b' : erAvail > 0 ? '#16a34a' : '#dc2626'}">${erAvail == null ? 'Not published' : `${erAvail} / ${erTot} Free`}</strong>
             </div>
             <div class="capacity-progress-track">
-              <div class="capacity-progress-fill" style="width:${Math.round(((erTot - erAvail)/erTot)*100)}%; background:${occColor};"></div>
+               <div class="capacity-progress-fill" style="width:${occupancy ?? 0}%; background:${occColor};"></div>
             </div>
           </div>
 
@@ -633,10 +633,10 @@ function showHospitalDetails(hospital) {
           <div class="meter-card">
             <div class="meter-label-row">
               <span>ICU &amp; Critical Beds</span>
-              <strong style="color:${icuAvail > 0 ? '#16a34a' : '#dc2626'}">${icuAvail} / ${icuTot} Free</strong>
+             <strong style="color:${icuAvail == null ? '#64748b' : icuAvail > 0 ? '#16a34a' : '#dc2626'}">${icuAvail == null ? 'Not published' : `${icuAvail} / ${icuTot} Free`}</strong>
             </div>
             <div class="capacity-progress-track">
-              <div class="capacity-progress-fill" style="width:${Math.round(((icuTot - icuAvail)/icuTot)*100)}%; background:${icuAvail > 0 ? '#2563eb' : '#dc2626'};"></div>
+               <div class="capacity-progress-fill" style="width:${icuLoad}%; background:${icuAvail == null ? '#64748b' : icuAvail > 0 ? '#2563eb' : '#dc2626'};"></div>
             </div>
           </div>
 
@@ -644,10 +644,10 @@ function showHospitalDetails(hospital) {
           <div class="meter-card">
             <div class="meter-label-row">
               <span>Ventilators</span>
-              <strong style="color:${vAvail > 0 ? '#16a34a' : '#dc2626'}">${vAvail} / ${vTot} Active</strong>
+             <strong style="color:${vAvail == null ? '#64748b' : vAvail > 0 ? '#16a34a' : '#dc2626'}">${vAvail == null ? 'Not published' : `${vAvail} / ${vTot} Active`}</strong>
             </div>
             <div class="capacity-progress-track">
-              <div class="capacity-progress-fill" style="width:${Math.round(((vTot - vAvail)/vTot)*100)}%; background:#8b5cf6;"></div>
+               <div class="capacity-progress-fill" style="width:${ventilatorLoad}%; background:${vAvail == null ? '#64748b' : '#8b5cf6'};"></div>
             </div>
           </div>
 
@@ -655,10 +655,10 @@ function showHospitalDetails(hospital) {
           <div class="meter-card">
             <div class="meter-label-row">
               <span>Oxygen Reserves</span>
-              <strong style="color:#16a34a;">${o2Pct}% (${o2Hours}h)</strong>
+             <strong style="color:${o2Pct == null ? '#64748b' : '#16a34a'};">${o2Pct == null ? 'Not published' : `${o2Pct}% (${o2Hours}h)`}</strong>
             </div>
             <div class="capacity-progress-track">
-              <div class="capacity-progress-fill" style="width:${o2Pct}%; background:#10b981;"></div>
+               <div class="capacity-progress-fill" style="width:${o2Pct ?? 0}%; background:${o2Pct == null ? '#64748b' : '#10b981'};"></div>
             </div>
           </div>
         </div>
@@ -668,26 +668,26 @@ function showHospitalDetails(hospital) {
       <div class="detail-section">
         <h4>👨‍⚕️ Emergency Specialists &amp; Crew on Duty</h4>
         <div class="specialists-grid">
-          <div class="spec-item ${specs.trauma_surgeon ? 'spec-on' : 'spec-off'}">
-            <span>${specs.trauma_surgeon ? '✅' : '❌'} Trauma Surgeon</span>
-            <small>${specs.trauma_surgeon ? 'In Resuscitation Bay' : 'Off-Duty'}</small>
-          </div>
-          <div class="spec-item ${specs.cardiologist ? 'spec-on' : 'spec-off'}">
-            <span>${specs.cardiologist ? '✅' : '❌'} Cardiologist</span>
-            <small>${specs.cardiologist ? 'On Call (Cath Lab)' : 'Unavailable'}</small>
-          </div>
-          <div class="spec-item ${specs.neurologist ? 'spec-on' : 'spec-off'}">
-            <span>${specs.neurologist ? '✅' : '❌'} Neurosurgeon</span>
-            <small>${specs.neurologist ? 'Active on Floor' : 'Unavailable'}</small>
-          </div>
-          <div class="spec-item ${specs.anesthesiologist ? 'spec-on' : 'spec-off'}">
-            <span>${specs.anesthesiologist ? '✅' : '❌'} Anesthesiologist</span>
-            <small>${specs.anesthesiologist ? 'On Duty' : 'Unavailable'}</small>
-          </div>
+           <div class="spec-item ${specs.trauma_surgeon == null ? '' : specs.trauma_surgeon ? 'spec-on' : 'spec-off'}">
+             <span>${specs.trauma_surgeon == null ? '❔' : specs.trauma_surgeon ? '✅' : '❌'} Trauma Surgeon</span>
+             <small>${specs.trauma_surgeon == null ? 'Not published' : specs.trauma_surgeon ? 'In Resuscitation Bay' : 'Off-Duty'}</small>
+           </div>
+           <div class="spec-item ${specs.cardiologist == null ? '' : specs.cardiologist ? 'spec-on' : 'spec-off'}">
+             <span>${specs.cardiologist == null ? '❔' : specs.cardiologist ? '✅' : '❌'} Cardiologist</span>
+             <small>${specs.cardiologist == null ? 'Not published' : specs.cardiologist ? 'On Call (Cath Lab)' : 'Unavailable'}</small>
+           </div>
+           <div class="spec-item ${specs.neurologist == null ? '' : specs.neurologist ? 'spec-on' : 'spec-off'}">
+             <span>${specs.neurologist == null ? '❔' : specs.neurologist ? '✅' : '❌'} Neurosurgeon</span>
+             <small>${specs.neurologist == null ? 'Not published' : specs.neurologist ? 'Active on Floor' : 'Unavailable'}</small>
+           </div>
+           <div class="spec-item ${specs.anesthesiologist == null ? '' : specs.anesthesiologist ? 'spec-on' : 'spec-off'}">
+             <span>${specs.anesthesiologist == null ? '❔' : specs.anesthesiologist ? '✅' : '❌'} Anesthesiologist</span>
+             <small>${specs.anesthesiologist == null ? 'Not published' : specs.anesthesiologist ? 'On Duty' : 'Unavailable'}</small>
+           </div>
         </div>
         <div class="staff-count-row">
-          <span>👩‍⚕️ ER Doctors on Shift: <strong>${hospital.er_doctors_count ?? 6}</strong></span>
-          <span>🩺 Nursing Staff: <strong>${hospital.nurse_staff_count ?? 18}</strong></span>
+           <span>👩‍⚕️ ER Doctors on Shift: <strong>${hospital.er_doctors_count ?? 'Not published'}</strong></span>
+           <span>🩺 Nursing Staff: <strong>${hospital.nurse_staff_count ?? 'Not published'}</strong></span>
         </div>
       </div>
 
@@ -695,21 +695,21 @@ function showHospitalDetails(hospital) {
       <div class="detail-section">
         <h4>🩸 Blood Bank &amp; Critical Care Facilities</h4>
         <div class="blood-bank-pills">
-          <span class="blood-pill">O- Universal: <strong>${blood.O_neg ?? 4} units</strong></span>
-          <span class="blood-pill">O+: <strong>${blood.O_pos ?? 12} units</strong></span>
-          <span class="blood-pill">A+: <strong>${blood.A_pos ?? 8} units</strong></span>
-          <span class="blood-pill">B+: <strong>${blood.B_pos ?? 10} units</strong></span>
+           <span class="blood-pill">O- Universal: <strong>${blood.O_neg ?? 'Not published'}</strong></span>
+           <span class="blood-pill">O+: <strong>${blood.O_pos ?? 'Not published'}</strong></span>
+           <span class="blood-pill">A+: <strong>${blood.A_pos ?? 'Not published'}</strong></span>
+           <span class="blood-pill">B+: <strong>${blood.B_pos ?? 'Not published'}</strong></span>
         </div>
 
         <div class="facilities-tags">
-          <span class="fac-tag ${facilities.cath_lab_active ? 'fac-ready' : 'fac-down'}">
-            ${facilities.cath_lab_active ? '✅' : '⚠️'} Cath Lab Ready
-          </span>
-          <span class="fac-tag ${facilities.ct_scanner_ready ? 'fac-ready' : 'fac-down'}">
-            ${facilities.ct_scanner_ready ? '✅' : '⚠️'} CT Scan Active
-          </span>
-          <span class="fac-tag ${facilities.trauma_bay_ready ? 'fac-ready' : 'fac-down'}">
-            ${facilities.trauma_bay_ready ? '✅' : '⚠️'} Trauma Bay 1 &amp; 2
+           <span class="fac-tag ${facilities.cath_lab_active == null ? '' : facilities.cath_lab_active ? 'fac-ready' : 'fac-down'}">
+             ${facilities.cath_lab_active == null ? '❔' : facilities.cath_lab_active ? '✅' : '⚠️'} Cath Lab ${facilities.cath_lab_active == null ? 'Not published' : 'Ready'}
+           </span>
+           <span class="fac-tag ${facilities.ct_scanner_ready == null ? '' : facilities.ct_scanner_ready ? 'fac-ready' : 'fac-down'}">
+             ${facilities.ct_scanner_ready == null ? '❔' : facilities.ct_scanner_ready ? '✅' : '⚠️'} CT Scan ${facilities.ct_scanner_ready == null ? 'Not published' : 'Active'}
+           </span>
+           <span class="fac-tag ${facilities.trauma_bay_ready == null ? '' : facilities.trauma_bay_ready ? 'fac-ready' : 'fac-down'}">
+             ${facilities.trauma_bay_ready == null ? '❔' : facilities.trauma_bay_ready ? '✅' : '⚠️'} Trauma Bay ${facilities.trauma_bay_ready == null ? 'Not published' : '1 &amp; 2'}
           </span>
         </div>
       </div>
@@ -722,12 +722,7 @@ function showHospitalDetails(hospital) {
 
       <!-- Interactive Actions -->
       <div class="detail-interactive-actions">
-        <button class="btn-action-sm" onclick="window.HospitalService.simulateAdmissionForSelected()">
-          🚨 Simulate Patient Check-in (-1 ER Bed)
-        </button>
-        <button class="btn-action-sm" onclick="window.HospitalService.toggleHospitalDivertStatus('${hospital.place_id}')">
-          🔄 Toggle Divert Status
-        </button>
+        ${operationalActions}
       </div>
 
       <div class="navigation-actions">

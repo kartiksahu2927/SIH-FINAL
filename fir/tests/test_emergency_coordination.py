@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from mediroute.models import EmergencyHospitalResponse, EmergencyRequest, EmergencyRouteDecision, Hospital, LocationEvent, Notification, User, AmbulanceDriver
 from mediroute.services import MapBridge
+from mediroute.security import hash_password
 
 
 @pytest.fixture
@@ -42,6 +43,13 @@ def scenario(monkeypatch):
     monkeypatch.setattr(app.bridge, 'update_location', location)
     monkeypatch.setattr(app.bridge, 'update_destination', destination)
     with TestClient(app.app) as client:
+        # This is a coordination alternative used only by this backend test
+        # fixture. Production KS reception is the map module's copied JS page.
+        with Session(app.engine) as db:
+            alternative = Hospital(name='KS Hospital - Test Alternative', address='Test', phone='000', latitude=27.6182, longitude=77.6014, emergency_capacity=18, emergency_available=8, beds_available=18, doctors_available=5, services=['emergency', 'trauma'], map_place_id='KS001', demo_facility=True, capabilities_source='TEST', location_source='TEST')
+            db.add(alternative); db.flush()
+            db.add(User(email='ks-hospital@mediroute.demo', password_hash=hash_password('MediRoute!2026'), full_name='KS Test Alternative', role='HOSPITAL', hospital_id=alternative.id, language='en'))
+            db.commit()
         headers = {}
         for role in ('patient', 'driver', 'hospital', 'ks-hospital', 'admin'):
             response = client.post('/api/auth/login', json={'email': f'{role}@mediroute.demo', 'password': 'MediRoute!2026'})

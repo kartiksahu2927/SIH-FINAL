@@ -12,20 +12,11 @@ const LocationTracker = {
   activeUnitId: "AMB-101",
   isTracking: false,
   watchId: null,
-
-  // Built-in landmark directory for instant zero-latency address resolution
-  LANDMARKS: {
-    "kd campus": { lat: 27.646870, lng: 77.551921, name: "K.D. Medical College & Apex Trauma Hub" },
-    "k.d. medical": { lat: 27.646870, lng: 77.551921, name: "K.D. Medical College & Apex Trauma Hub" },
-    "nh-19 highway": { lat: 27.648500, lng: 77.554200, name: "NH-19 Highway Corridor Mile 42" },
-    "highway": { lat: 27.648500, lng: 77.554200, name: "NH-19 Highway Corridor Mile 42" },
-    "nayati": { lat: 27.564500, lng: 77.632500, name: "Nayati Medicity Sector Corridor" },
-    "nayati medicity": { lat: 27.564500, lng: 77.632500, name: "Nayati Medicity Sector Corridor" },
-    "district hospital": { lat: 27.508500, lng: 77.662000, name: "Mathura Combined District Center" },
-    "mathura": { lat: 27.508500, lng: 77.662000, name: "Mathura Combined District Center" },
-    "vrindavan": { lat: 27.578000, lng: 77.684500, name: "Vrindavan Sector 4 First Response Post" },
-    "city center": { lat: 27.492400, lng: 77.673700, name: "Mathura City Center Emergency Bay" }
-  },
+  positionSource: null,
+  lastPositionAt: 0,
+  positionRevision: 0,
+  maxAgeMs: 120000,
+  manualSelection: false,
 
   // 4 Active Fleet Ambulances
   FLEET: [
@@ -41,17 +32,12 @@ const LocationTracker = {
       oxygen: "98%",
       battery: "94%",
       speed_kmh: 48,
-      lat: 27.646870,
-      lng: 77.551921,
-      location_name: "K.D. Medical College & Apex Trauma Hub",
-      address: "K.D. Medical College Campus, Mathura Corridor",
+      lat: null,
+      lng: null,
+      location_name: "Location not selected",
+      address: "",
       simIndex: 0,
       routePoints: [
-        { lat: 27.646870, lng: 77.551921 },
-        { lat: 27.648500, lng: 77.554200 },
-        { lat: 27.652000, lng: 77.558000 },
-        { lat: 27.655000, lng: 77.562000 },
-        { lat: 27.645050, lng: 77.550500 }
       ]
     },
     {
@@ -66,15 +52,12 @@ const LocationTracker = {
       oxygen: "95%",
       battery: "88%",
       speed_kmh: 0,
-      lat: 27.645050,
-      lng: 77.550500,
-      location_name: "KD Dental Station Outpost",
-      address: "KD Dental Outpost, Sector 2",
+      lat: null,
+      lng: null,
+      location_name: "Location not selected",
+      address: "",
       simIndex: 0,
       routePoints: [
-        { lat: 27.645050, lng: 77.550500 },
-        { lat: 27.646870, lng: 77.551921 },
-        { lat: 27.652000, lng: 77.558000 }
       ]
     },
     {
@@ -89,15 +72,12 @@ const LocationTracker = {
       oxygen: "88%",
       battery: "92%",
       speed_kmh: 32,
-      lat: 27.564500,
-      lng: 77.632500,
-      location_name: "Nayati Medicity Highway Corridor",
-      address: "Nayati Medicity Highway Junction",
+      lat: null,
+      lng: null,
+      location_name: "Location not selected",
+      address: "",
       simIndex: 0,
       routePoints: [
-        { lat: 27.564500, lng: 77.632500 },
-        { lat: 27.578000, lng: 77.684500 },
-        { lat: 27.569000, lng: 77.660000 }
       ]
     },
     {
@@ -112,36 +92,78 @@ const LocationTracker = {
       oxygen: "100%",
       battery: "99%",
       speed_kmh: 0,
-      lat: 27.508500,
-      lng: 77.662000,
-      location_name: "Mathura District Combined Hospital Base",
-      address: "Mathura Combined District Health Base",
+      lat: null,
+      lng: null,
+      location_name: "Location not selected",
+      address: "",
       simIndex: 0,
       routePoints: [
-        { lat: 27.508500, lng: 77.662000 },
-        { lat: 27.492400, lng: 77.673700 },
-        { lat: 27.485000, lng: 77.668000 }
       ]
     }
   ],
 
   start() {
-    this._broadcastFleet();
-    this._setStatus('tracking');
+    // Fleet seed coordinates are demo configuration, never a hardware GPS fix.
+    this.FLEET.forEach(unit => { unit.lat = null; unit.lng = null; unit.address = ''; unit.location_name = 'Location not selected'; });
     this._bindAddressEvents();
+    this.useGPS();
+  },
 
-    // Attempt browser hardware GPS for active unit
+  useGPS() {
+    this.manualSelection = false;
+    this.positionSource = null;
+    this.positionRevision++;
+    window.Dashboard?.clearNearbyResults('Waiting for a current GPS fix…');
+    if (this.watchId !== null) navigator.geolocation.clearWatch(this.watchId);
     if (navigator.geolocation) {
       this.watchId = navigator.geolocation.watchPosition(
         (pos) => this._onHardwareGPS(pos),
-        (err) => console.log('[Location] Operating in Fleet Geocoding & Address Mode.'),
-        { enableHighAccuracy: true, timeout: 8000 }
+        (err) => {
+          if (!this.manualSelection) {
+            this.positionSource = null;
+            this.positionRevision++;
+            window.Dashboard?.clearNearbyResults('GPS unavailable. Allow location access, or explicitly select an address/coordinates.');
+            this._locationMessage(`GPS unavailable: ${err.message}. Enter a location below; no Mathura fallback is used.`);
+          }
+        },
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
       );
       this.isTracking = true;
+    } else {
+      this._locationMessage('GPS unavailable in this browser. Select a location manually below.');
     }
   },
 
+  _locationMessage(message) {
+    const text = document.getElementById('gps-status-text');
+    if (text) text.textContent = message;
+  },
+
+  setSelectedPosition(lat, lng, label, source = 'MANUAL', timestamp = Date.now(), accuracy = null) {
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) throw new Error('Enter valid latitude and longitude.');
+    const unit = this.getActiveUnit();
+    const previous = this.positionSource ? {lat:unit.lat, lng:unit.lng} : null;
+    this.manualSelection = source !== 'GPS';
+    this.positionSource = source;
+    this.lastPositionAt = timestamp;
+    this.positionRevision++;
+    Object.assign(unit, {lat, lng, address:label, location_name:label, accuracy});
+    this._broadcastFleet();
+    this._locationMessage(`${source === 'GPS' ? 'Browser GPS' : 'Manually selected location'}: ${lat.toFixed(6)}, ${lng.toFixed(6)}${accuracy != null ? ` (±${Math.round(accuracy)} m)` : ''}`);
+    if (!previous || source !== 'GPS') window.recenterMapTo?.(lat, lng, 14);
+    if (!previous || this._distanceKm(previous.lat, previous.lng, lat, lng) > 0.1 || source !== 'GPS') window.Dashboard?.recalculateDistancesAndRoute();
+  },
+
   _bindAddressEvents() {
+    document.getElementById('btn-use-gps')?.addEventListener('click', () => this.useGPS());
+    document.getElementById('btn-use-coordinates')?.addEventListener('click', () => {
+      const lat = document.getElementById('selected-latitude').value.trim();
+      const lng = document.getElementById('selected-longitude').value.trim();
+      try {
+        if (!lat || !lng) throw new Error('Enter both latitude and longitude.');
+        this.setSelectedPosition(Number(lat), Number(lng), 'Explicitly selected coordinates');
+      } catch (error) { this._locationMessage(error.message); }
+    });
     const btn = document.getElementById('btn-update-address');
     const input = document.getElementById('amb-address-input');
 
@@ -169,59 +191,26 @@ const LocationTracker = {
 
   async setAmbulanceAddress(addressStr) {
     if (!addressStr) return;
-    const unit = this.getActiveUnit();
-    const query = addressStr.toLowerCase();
-
-    // Check fast local dictionary first
-    let resolved = null;
-    for (const [key, val] of Object.entries(this.LANDMARKS)) {
-      if (query.includes(key)) {
-        resolved = val;
-        break;
-      }
-    }
-
-    if (!resolved) {
-      // Try online geocoding
-      try {
-        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(addressStr)}&limit=1`);
-        const data = await res.json();
-        if (data && data.length > 0) {
-          resolved = {
-            lat: parseFloat(data[0].lat),
-            lng: parseFloat(data[0].lon),
-            name: data[0].display_name.split(',')[0]
-          };
-        }
-      } catch (e) {
-        console.warn('[Location] Online geocoding fallback error:', e);
-      }
-    }
-
-    if (resolved) {
-      unit.lat = Number(resolved.lat.toFixed(6));
-      unit.lng = Number(resolved.lng.toFixed(6));
-      unit.location_name = resolved.name || addressStr;
-      unit.address = addressStr;
-      unit.routePoints = this._generateSectorWaypoints(unit.lat, unit.lng);
-      unit.simIndex = 0;
-    } else {
-      // Offset slightly to represent custom position in sector
-      unit.location_name = addressStr;
-      unit.address = addressStr;
-    }
-
-    this._broadcastFleet();
-
-    if (typeof window.recenterMapTo === 'function') {
-      window.recenterMapTo(unit.lat, unit.lng, 14);
-    } else if (window.leafletMap) {
-      window.leafletMap.setView([unit.lat, unit.lng], 14, { animate: true });
-    }
-
-    if (typeof showToast === 'function') {
-      showToast(`📍 Ambulance location updated to: ${unit.address}`, 'success');
-    }
+    const results = document.getElementById('address-results');
+    if (!results) return;
+    results.replaceChildren();
+    this._locationMessage('Looking up address. Choose a returned location to confirm it.');
+    try {
+      const res = await fetch(`/api/location/search?q=${encodeURIComponent(addressStr)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Address lookup failed');
+      if (!data.length) { this._locationMessage('Address not found. Try the full address or enter coordinates.'); return; }
+      data.forEach(place => {
+        const button = document.createElement('button');
+        button.type = 'button'; button.className = 'btn-sm';
+        button.textContent = `${place.display_name} (${place.lat}, ${place.lon})`;
+        button.onclick = () => {
+          this.setSelectedPosition(Number(place.lat), Number(place.lon), place.display_name);
+          results.replaceChildren();
+        };
+        results.appendChild(button);
+      });
+    } catch (error) { this._locationMessage(`${error.message}. You can enter coordinates explicitly.`); }
   },
 
   getActiveUnit() {
@@ -237,7 +226,13 @@ const LocationTracker = {
     if (!unit) return;
 
     this.activeUnitId = unitId;
-    window.ambulancePosition = { lat: unit.lat, lng: unit.lng };
+    this.positionSource = null;
+    this.positionRevision++;
+    this._locationMessage('Vehicle changed. Use current GPS or select its actual location.');
+    window.Dashboard?.clearNearbyResults('Select this ambulance’s actual location.');
+    window.ambulancePosition = Number.isFinite(unit.lat) && Number.isFinite(unit.lng)
+      ? { lat: unit.lat, lng: unit.lng }
+      : null;
 
     // Update input address box with active unit address
     const input = document.getElementById('amb-address-input');
@@ -246,9 +241,9 @@ const LocationTracker = {
     // Broadcast update
     this._broadcastFleet();
 
-    if (typeof window.recenterMapTo === 'function') {
+    if (Number.isFinite(unit.lat) && Number.isFinite(unit.lng) && typeof window.recenterMapTo === 'function') {
       window.recenterMapTo(unit.lat, unit.lng, 14);
-    } else if (window.leafletMap) {
+    } else if (Number.isFinite(unit.lat) && Number.isFinite(unit.lng) && window.leafletMap) {
       window.leafletMap.setView([unit.lat, unit.lng], 14, { animate: true });
     }
 
@@ -263,47 +258,28 @@ const LocationTracker = {
 
   getCurrentPosition() {
     const active = this.getActiveUnit();
-    return Promise.resolve({ lat: active.lat, lng: active.lng, accuracy: 5.0 });
+    if (!this.positionSource || !Number.isFinite(active.lat) || !Number.isFinite(active.lng) || (this.positionSource === 'GPS' && Date.now() - this.lastPositionAt > this.maxAgeMs)) {
+      return Promise.reject(new Error('Fresh GPS is unavailable. Allow location access, or explicitly select an address/coordinates.'));
+    }
+    return Promise.resolve({ lat: active.lat, lng: active.lng, accuracy: active.accuracy, source: this.positionSource });
   },
 
   simulateStep() {
-    const unit = this.getActiveUnit();
-    if (!unit.routePoints || unit.routePoints.length === 0) {
-      unit.routePoints = this._generateSectorWaypoints(unit.lat, unit.lng);
-    }
-    unit.simIndex = (unit.simIndex + 1) % unit.routePoints.length;
-    const pt = unit.routePoints[unit.simIndex];
-    unit.lat = pt.lat;
-    unit.lng = pt.lng;
-    unit.speed_kmh = Math.floor(Math.random() * 25) + 35; // 35 - 60 km/h
-
-    this._broadcastFleet();
-
-    if (typeof window.recenterMapTo === 'function') {
-      window.recenterMapTo(unit.lat, unit.lng);
-    }
-
-    if (typeof showToast === 'function') {
-      showToast(`🚑 ${unit.callsign} moving along road route (Speed: ${unit.speed_kmh} km/h)`, 'info');
-    }
+    this._locationMessage('Use real GPS or explicitly selected coordinates. Simulated movement is disabled for nearby discovery.');
   },
 
   _onHardwareGPS(pos) {
+    if (this.manualSelection) return;
+    if (!Number.isFinite(pos.timestamp) || Date.now() - pos.timestamp > this.maxAgeMs || pos.timestamp > Date.now() + 5000) {
+      this._locationMessage('GPS fix is stale; waiting for a current fix.');
+      return;
+    }
     const lat = pos.coords.latitude;
     const lng = pos.coords.longitude;
     const active = this.getActiveUnit();
 
-    const distMoved = this._distanceKm(active.lat, active.lng, lat, lng);
-    active.lat = lat;
-    active.lng = lng;
     active.speed_kmh = Math.round((pos.coords.speed || 0) * 3.6);
-
-    if (distMoved > 2.0 || !this._sectorAnchored) {
-      this._realignFleetSector(lat, lng);
-      this._sectorAnchored = true;
-    }
-
-    this._broadcastFleet();
+    this.setSelectedPosition(lat, lng, 'Current browser GPS', 'GPS', pos.timestamp, pos.coords.accuracy);
   },
 
   _realignFleetSector(centerLat, centerLng) {
@@ -381,13 +357,14 @@ const LocationTracker = {
   },
 
   _broadcastFleet() {
+    if (!this.positionSource) return;
     const active = this.getActiveUnit();
     window.ambulancePosition = { lat: active.lat, lng: active.lng };
-    window.ambulanceFleet = this.FLEET;
+    window.ambulanceFleet = this.FLEET.filter(unit => Number.isFinite(unit.lat) && Number.isFinite(unit.lng));
 
     // Update map markers
     if (typeof updateFleetMarkers === 'function') {
-      updateFleetMarkers(this.FLEET, this.activeUnitId);
+      updateFleetMarkers(window.ambulanceFleet, this.activeUnitId);
     } else if (typeof updateAmbulanceLocation === 'function') {
       updateAmbulanceLocation(active.lat, active.lng);
     }
@@ -423,9 +400,9 @@ const LocationTracker = {
     const dopEl = document.getElementById('telemetry-dop');
     const coordsEl = document.getElementById('telemetry-coords');
 
-    if (utmEl) utmEl.textContent = geodetics.utm;
-    if (geohashEl) geohashEl.textContent = `${geodetics.geohash} • WGS84`;
-    if (dopEl) dopEl.textContent = geodetics.dop;
+    if (utmEl) utmEl.textContent = 'Not supplied by browser';
+    if (geohashEl) geohashEl.textContent = 'WGS84';
+    if (dopEl) dopEl.textContent = unit.accuracy != null ? `±${Math.round(unit.accuracy)} m` : 'Manual selection';
     if (coordsEl) coordsEl.textContent = geodetics.dms;
 
     // Update telemetry card details

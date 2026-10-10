@@ -9,10 +9,12 @@ Defines REST endpoints for:
 """
 
 from flask import Blueprint, request, jsonify
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 import os
 import requests
+import threading
+from copy import deepcopy
 
 api_bp = Blueprint('api', __name__, url_prefix='/api')
 
@@ -992,6 +994,16 @@ DEFAULT_HOSPITALS = [
     }
 ]
 
+# KS Hospital is a second reception dashboard using the same JS Hospital
+# configuration and workflow.  Only its identifier and display name differ.
+DEFAULT_HOSPITALS.append({
+    **DEFAULT_HOSPITALS[0],
+    "place_id": "KS001",
+    "hospital_id": "KS001",
+    "name": "KS Hospital - Emergency Center",
+    "demo_copy_of": "JS001",
+})
+
 # In-memory storage for hackathon prototype
 hospital_eligibility = {}
 
@@ -1039,6 +1051,102 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     a = math.sin(dlat / 2.0) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2.0) ** 2
     c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     return R * c
+
+
+_nearby_cache = {}
+
+
+def fetch_osm_hospitals(lat, lng, radius_km):
+    """Return only OSM objects explicitly tagged as hospitals.
+
+    The old nearby endpoint returned the static Mathura catalog and then filled
+    empty searches with the closest regional records.  That made a Greater
+    Noida search display unrelated demo places.  OSM is queried from the
+    supplied coordinates; no result is synthesized when the provider fails.
+    """
+    key = (lat, lng, radius_km)
+    cached = _nearby_cache.get(key)
+    if cached and time.monotonic() - cached[0] < 120:
+        return deepcopy(cached[1])
+    radius_m = int(max(1000, min(float(radius_km), 100.0) * 1000))
+    query = f"""[out:json][timeout:25];
+(
+  nwr[amenity=hospital](around:{radius_m},{lat},{lng});
+  nwr[healthcare=hospital](around:{radius_m},{lat},{lng});
+);
+out center tags;"""
+    endpoints = [item.strip() for item in os.environ.get(
+        'OSM_OVERPASS_ENDPOINTS',
+        'https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter'
+    ).split(',') if item.strip()]
+    last_error = None
+    for endpoint in endpoints:
+        try:
+            response = requests.post(endpoint, data={'data': query}, headers={'User-Agent': 'MediRoute/2.0 hospital discovery'}, timeout=35)
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get('elements'), list) or payload.get('remark'):
+                raise ValueError('Invalid or incomplete Overpass response')
+            records = {}
+            for element in payload.get('elements', []):
+                if not isinstance(element, dict):
+                    continue
+                tags = element.get('tags') or {}
+                if tags.get('amenity') != 'hospital' and tags.get('healthcare') != 'hospital':
+                    continue
+                if tags.get('amenity') in ('university', 'college', 'school') or tags.get('shop'):
+                    continue
+                point = element.get('center') or element
+                name = str(tags.get('name') or tags.get('name:en') or '').strip()
+                if not name:
+                    continue
+                try:
+                    h_lat, h_lng = float(point['lat']), float(point['lon'])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not (-90 <= h_lat <= 90 and -180 <= h_lng <= 180):
+                    continue
+                osm_type, osm_id = element.get('type', 'unknown'), element.get('id')
+                if osm_type not in ('node', 'way', 'relation') or not isinstance(osm_id, int):
+                    continue
+                address = tags.get('addr:full') or ', '.join(str(tags[key]).strip() for key in ('addr:housenumber', 'addr:street', 'addr:city', 'addr:state', 'addr:postcode') if tags.get(key))
+                distance = haversine_distance(lat, lng, h_lat, h_lng)
+                if distance > radius_km:
+                    continue
+                speciality = str(tags.get('healthcare:speciality') or '')
+                specialized = any(term in (name + ' ' + speciality).lower() for term in ('dental', 'dentist', 'dentistry', 'naturopath', 'ayurved', 'homeopath', 'homoeopath'))
+                if specialized:
+                    continue
+                records[f'osm-{osm_type}-{osm_id}'] = {
+                    'place_id': f'osm-{osm_type}-{osm_id}',
+                    'hospital_id': f'osm-{osm_type}-{osm_id}',
+                    'name': name,
+                    'facility_type': 'hospital',
+                    'latitude': h_lat,
+                    'longitude': h_lng,
+                    'address': address or None,
+                    'distance_km': round(distance, 2),
+                    'services': [item.strip() for item in str(tags.get('healthcare:speciality') or '').replace(';', ',').split(',') if item.strip()],
+                    'emergency_service_published': str(tags.get('emergency') or '').lower() in ('yes', '24/7', 'emergency'),
+                    'availability_source': 'UNKNOWN',
+                    'availability_status': 'Not published by OpenStreetMap nearby search',
+                    'emergency_bed_available': None,
+                    'doctor_available': None,
+                    'accepted': None,
+                    'source': 'OpenStreetMap Overpass',
+                    'source_url': f'https://www.openstreetmap.org/{osm_type}/{osm_id}',
+                    'phone': tags.get('phone') or tags.get('contact:phone'),
+                    'fetched_at': datetime.now(timezone.utc).isoformat(),
+                }
+            result = sorted(records.values(), key=lambda item: item['distance_km'])
+            if len(_nearby_cache) >= 64:
+                _nearby_cache.pop(next(iter(_nearby_cache)))
+            _nearby_cache[key] = (time.monotonic(), deepcopy(result))
+            return result
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            last_error = exc
+    print(f'[Nearby Hospitals] OSM discovery failed: {last_error}')
+    return None
 
 
 def fetch_street_route(orig_lat, orig_lng, dest_lat, dest_lng):
@@ -1382,144 +1490,59 @@ def get_hospital_eligibility(place_id):
 
 @api_bp.route('/hospitals/nearby', methods=['GET', 'POST'])
 def get_nearby_hospitals():
-    """
-    Search nearby hospitals around a coordinate.
-    Supports query parameters or JSON body: lat, lng, radius (km).
-    Returns complete real-time operational telemetry for every discovered hospital.
-    Guarantees that ambulances in any location (Mathura, Delhi, or elsewhere) always receive emergency facilities.
-    """
-    apply_realistic_telemetry_drift()
-
-    if request.method == 'POST':
-        data = request.get_json(silent=True) or {}
-        lat = float(data.get('lat', AMBULANCE_FLEET["AMB-101"]['lat']))
-        lng = float(data.get('lng', AMBULANCE_FLEET["AMB-101"]['lng']))
-        radius_km = float(data.get('radius_km', 30.0))
-    else:
-        lat = float(request.args.get('lat', AMBULANCE_FLEET["AMB-101"]['lat']))
-        lng = float(request.args.get('lng', AMBULANCE_FLEET["AMB-101"]['lng']))
-        radius_km = float(request.args.get('radius_km', 30.0))
-
-    all_scored = []
-    for place_id, h in hospital_eligibility.items():
-        dist = haversine_distance(lat, lng, h['latitude'], h['longitude'])
-        est_minutes = max(2, int(round((dist * 1.25 / 30.0) * 60)))
-        
-        hrs = est_minutes // 60
-        mins = est_minutes % 60
-        duration_text = f"{hrs} hr {mins} min" if hrs > 0 else f"{mins} min"
-
-        item = {
-            **h,
-            'distance_km': round(dist, 2),
-            'estimated_duration_min': est_minutes,
-            'duration_text': duration_text,
-        }
-        all_scored.append(item)
-
-    all_scored.sort(key=lambda x: x['distance_km'])
-
-    # 1. Filter by radius
-    results = [h for h in all_scored if h['distance_km'] <= radius_km]
-
-    # 2. If fewer than 3 hospitals in radius, auto-expand to include closest regional facilities
-    if len(results) < 3 and len(all_scored) > 0:
-        results = all_scored[:min(12, len(all_scored))]
-
-    # 3. If closest hospital is > 25km away (e.g. user is in a different city), synthesize local trauma network
-    if len(results) > 0 and results[0]['distance_km'] > 25.0:
-        local_hospitals = [
-            {
-                "place_id": f"HOSP_LOCAL_APEX_{int(lat*100)}_{int(lng*100)}",
-                "name": "Regional Apex Emergency & Trauma Center",
-                "latitude": round(lat + 0.008, 6),
-                "longitude": round(lng + 0.006, 6),
-                "address": "Primary Emergency Corridor / Highway Junction",
-                "phone": "+91 1800 108 0108",
-                "rating": 4.8,
-                "user_ratings_total": 1950,
-                "emergency_beds_total": 28,
-                "emergency_beds_available": 12,
-                "icu_beds_total": 10,
-                "icu_beds_available": 4,
-                "ventilators_total": 6,
-                "ventilators_available": 3,
-                "pediatric_beds_available": 5,
-                "oxygen_level_pct": 98,
-                "oxygen_hours_remaining": 64,
-                "divert_status": "OPEN",
-                "er_wait_time_minutes": 0,
-                "er_doctors_count": 7,
-                "nurse_staff_count": 18,
-                "specialists_on_duty": { "trauma_surgeon": True, "cardiologist": True, "neurologist": True, "anesthesiologist": True, "orthopedic_surgeon": True },
-                "blood_bank": { "O_neg": 5, "O_pos": 16, "A_pos": 12, "B_pos": 14, "AB_pos": 6 },
-                "critical_facilities": { "cath_lab_active": True, "ct_scanner_ready": True, "trauma_bay_ready": True, "burn_unit_ready": True },
-                "emergency_bed_available": True,
-                "doctor_available": True,
-                "icu_available": True,
-                "specialist_available": ["trauma", "cardiology", "neurology"],
-                "accepted": None,
-                "telemetry_source": "Local Regional HL7 Node",
-                "last_heartbeat_timestamp": datetime.now(timezone.utc).isoformat()
-            },
-            {
-                "place_id": f"HOSP_LOCAL_MEDICITY_{int(lat*100)}_{int(lng*100)}",
-                "name": "City Medicity Multi Super Speciality Hospital",
-                "latitude": round(lat - 0.012, 6),
-                "longitude": round(lng - 0.009, 6),
-                "address": "Central Civil Hospital Road",
-                "phone": "+91 1800 108 0109",
-                "rating": 4.6,
-                "user_ratings_total": 1420,
-                "emergency_beds_total": 22,
-                "emergency_beds_available": 9,
-                "icu_beds_total": 8,
-                "icu_beds_available": 3,
-                "ventilators_total": 6,
-                "ventilators_available": 2,
-                "pediatric_beds_available": 4,
-                "oxygen_level_pct": 96,
-                "oxygen_hours_remaining": 52,
-                "divert_status": "OPEN",
-                "er_wait_time_minutes": 1,
-                "er_doctors_count": 6,
-                "nurse_staff_count": 15,
-                "specialists_on_duty": { "trauma_surgeon": True, "cardiologist": True, "neurologist": False, "anesthesiologist": True, "orthopedic_surgeon": True },
-                "blood_bank": { "O_neg": 4, "O_pos": 12, "A_pos": 10, "B_pos": 11, "AB_pos": 4 },
-                "critical_facilities": { "cath_lab_active": True, "ct_scanner_ready": True, "trauma_bay_ready": True, "burn_unit_ready": False },
-                "emergency_bed_available": True,
-                "doctor_available": True,
-                "icu_available": True,
-                "specialist_available": ["trauma", "general_surgery", "orthopedics"],
-                "accepted": None,
-                "telemetry_source": "City Emergency Network Stream",
-                "last_heartbeat_timestamp": datetime.now(timezone.utc).isoformat()
-            }
-        ]
-
-        for lh in local_hospitals:
-            sync_hospital_record(lh)
-            hospital_eligibility[lh['place_id']] = lh
-            dist = haversine_distance(lat, lng, lh['latitude'], lh['longitude'])
-            est_minutes = max(2, int(round((dist * 1.25 / 30.0) * 60)))
-            lh['distance_km'] = round(dist, 2)
-            lh['estimated_duration_min'] = est_minutes
-            lh['duration_text'] = f"{est_minutes} min"
-            results.insert(0, lh)
-
-    results.sort(key=lambda x: x['distance_km'])
+    """Search real OSM hospitals inside the explicitly selected radius."""
+    data = (request.get_json(silent=True) or {}) if request.method == 'POST' else request.args
+    if not isinstance(data, (dict, type(request.args))):
+        return jsonify({'success': False, 'error': 'Expected coordinate fields'}), 400
+    try:
+        lat = float(data.get('lat'))
+        lng = float(data.get('lng'))
+        radius_km = float(data.get('radius_km', 10.0))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Select a current GPS or explicit location before searching. lat and lng are required.'}), 400
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180 and 1 <= radius_km <= 100):
+        return jsonify({'success': False, 'error': 'Invalid coordinates or radius. Radius must be 1–100 km.'}), 400
+    results = fetch_osm_hospitals(lat, lng, radius_km)
+    if results is None:
+        return jsonify({'success': False, 'error': 'Nearby hospital provider is temporarily unavailable. Retry shortly; no static or fabricated hospital list was substituted.', 'hospitals': []}), 502
     return jsonify({
         'success': True,
-        'origin': {'lat': lat, 'lng': lng},
+        'origin': {'lat': lat, 'lng': lng, 'source': 'selected_coordinates'},
+        'radius_km': radius_km,
         'count': len(results),
         'timestamp': datetime.now(timezone.utc).isoformat(),
-        'hospitals': results
+        'source': 'OpenStreetMap Overpass',
+        'hospitals': results,
+        'message': 'No hospital records found in this radius. Increase the radius explicitly to search farther.' if not results else 'Distances use the selected coordinates; availability and road ETA are not inferred.',
     })
-
 
 # ============================================================
 # LEGACY AMBULANCE COMPATIBILITY
 # ============================================================
+
+@api_bp.route('/location/search', methods=['GET'])
+def search_location():
+    query = str(request.args.get('q', '')).strip()
+    if len(query) < 3:
+        return jsonify([])
+    try:
+        response = requests.get(
+            'https://nominatim.openstreetmap.org/search',
+            params={'format': 'jsonv2', 'q': query, 'limit': 5, 'countrycodes': 'in'},
+            headers={'User-Agent': 'MediRoute/2.0 location selection'},
+            timeout=15,
+        )
+        response.raise_for_status()
+        results = []
+        for item in response.json():
+            try:
+                lat, lng = float(item['lat']), float(item['lon'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            results.append({'lat': lat, 'lon': lng, 'display_name': item.get('display_name', 'Selected location')})
+        return jsonify(results)
+    except (requests.RequestException, ValueError, TypeError):
+        return jsonify({'success': False, 'error': 'Location lookup is temporarily unavailable.'}), 502
 
 @api_bp.route('/ambulance/location', methods=['POST'])
 def update_ambulance_location():
@@ -1591,6 +1614,8 @@ def calculate_route():
 emergency_requests = {}
 active_emergency_request_id = None
 _socketio_emitter_func = None
+emergency_state_lock = threading.RLock()
+RESPONSE_WINDOW_SECONDS = 60
 
 
 def set_socketio_emitter(emitter_func):
@@ -1609,49 +1634,84 @@ def broadcast_socket_event(event_name, data):
             print(f"[Socket.IO Emitter Error] {event_name}: {e}")
 
 
+def _hospital_targets():
+    return [hospital_eligibility[place_id] for place_id in ("JS001", "KS001") if place_id in hospital_eligibility]
+
+
+def _target_payload(hospital, amb_lat, amb_lng, patient_condition, patient_name, amb_unit):
+    hosp_lat = float(hospital.get("latitude", 27.652000))
+    hosp_lng = float(hospital.get("longitude", 77.558000))
+    route_data = fetch_street_route(amb_lat, amb_lng, hosp_lat, hosp_lng)
+    return {
+        "hospital_id": hospital.get("place_id"),
+        "hospital_name": hospital.get("name"),
+        "hospital_address": hospital.get("address"),
+        "hospital_location": {"lat": hosp_lat, "lng": hosp_lng},
+        "distance_km": route_data.get("distance_km"),
+        "eta_min": route_data.get("duration_min"),
+        "eta_text": f"{route_data.get('duration_min')} min" if route_data.get("duration_min", 0) < 60 else f"{route_data.get('duration_min') // 60} hr {route_data.get('duration_min') % 60} min",
+        "route_points": route_data.get("points", []),
+        "emergency_bed_available": bool(hospital.get("emergency_bed_available", True)),
+        "emergency_beds_count": hospital.get("emergency_beds_available", 15),
+        "icu_available": bool(hospital.get("icu_available", True)),
+        "icu_beds_count": hospital.get("icu_beds_available", 6),
+        "required_facility_available": bool(hospital.get("required_facility_available", True)),
+        "specialists_available": hospital.get("specialist_available", ["trauma", "cardiology", "neurology"]),
+        "response_status": "PENDING",
+        "responded_at": None,
+    }
+
+
+def _expire_request(req):
+    """Enforce the server deadline before any read or response is processed."""
+    if req.get("expired_at"):
+        return False
+    deadline = datetime.fromisoformat(req["response_deadline"].replace("Z", "+00:00"))
+    if datetime.now(timezone.utc) < deadline:
+        return False
+    for response in req.get("hospital_responses", {}).values():
+        if response["status"] == "PENDING":
+            response["status"] = "TIMED_OUT"
+            response["responded_at"] = datetime.now(timezone.utc).isoformat()
+    req["expired_at"] = datetime.now(timezone.utc).isoformat()
+    if not any(response["status"] == "ACCEPTED" for response in req.get("hospital_responses", {}).values()):
+        req["status"] = "EXPIRED"
+    broadcast_socket_event("emergency_response_window_expired", req)
+    broadcast_socket_event("emergency_status_update", req)
+    return True
+
+
 @api_bp.route('/emergency/request', methods=['POST'])
 def create_emergency_request():
     """
-    AMBULANCE DEVICE 1 -> Sends emergency patient onboard request to JS Hospital (DEVICE 2).
-    Generates a unique request ID, calculates real street road distance & ETA, stores state as PENDING,
-    and immediately broadcasts a real-time event to the JS Hospital dashboard.
+    AMBULANCE DEVICE 1 -> Sends one request to both hospital reception dashboards.
+    Each hospital has an independent response row and the server starts one
+    authoritative 60-second response window.
     """
     global active_emergency_request_id
     data = request.get_json(silent=True) or {}
 
     ambulance_id = data.get('ambulance_id', 'AMB-101')
-    hospital_id = data.get('hospital_id', 'JS001')
     patient_condition = data.get('patient_condition', 'Emergency Trauma / Critical Patient')
     patient_name = data.get('patient_name', 'Emergency Patient')
 
-    # Get ambulance coordinates
+    # A dispatch must carry the current GPS/explicitly selected position.
     amb_unit = AMBULANCE_FLEET.get(ambulance_id, AMBULANCE_FLEET["AMB-101"])
-    amb_lat = float(data.get('lat', amb_unit.get('lat', 27.646870)))
-    amb_lng = float(data.get('lng', amb_unit.get('lng', 77.551921)))
-
-    # Get target hospital
-    hospital = hospital_eligibility.get(hospital_id)
-    if not hospital:
-        # Fallback to JS Hospital
-        hospital = hospital_eligibility.get('JS001', DEFAULT_HOSPITALS[0])
-
-    hosp_lat = float(hospital.get('latitude', 27.652000))
-    hosp_lng = float(hospital.get('longitude', 77.558000))
-
-    # Calculate real road distance & ETA
     try:
-        route_data = fetch_street_route(amb_lat, amb_lng, hosp_lat, hosp_lng)
-        distance_km = route_data['distance_km']
-        eta_min = route_data['duration_min']
-        route_points = route_data.get('points', [])
-    except Exception:
-        dist_direct = haversine_distance(amb_lat, amb_lng, hosp_lat, hosp_lng)
-        distance_km = round(dist_direct, 2)
-        eta_min = max(2, int(round((distance_km * 1.25 / 30.0) * 60)))
-        route_points = [{'lat': amb_lat, 'lng': amb_lng}, {'lat': hosp_lat, 'lng': hosp_lng}]
+        amb_lat = float(data['lat'])
+        amb_lng = float(data['lng'])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Current ambulance latitude and longitude are required.'}), 400
+    if not (-90 <= amb_lat <= 90 and -180 <= amb_lng <= 180):
+        return jsonify({'success': False, 'error': 'Invalid ambulance coordinates.'}), 400
 
-    request_id = f"REQ-{datetime.now().strftime('%H%M%S')}-{ambulance_id}"
-
+    now = datetime.now(timezone.utc)
+    request_id = f"REQ-{now.strftime('%H%M%S%f')}-{ambulance_id}"
+    targets = _hospital_targets()
+    target_payloads = [_target_payload(hospital, amb_lat, amb_lng, patient_condition, patient_name, amb_unit) for hospital in targets]
+    response_map = {target["hospital_id"]: {"status": "PENDING", "responded_at": None, "reason": None} for target in target_payloads}
+    deadline = now + timedelta(seconds=RESPONSE_WINDOW_SECONDS)
+    primary = next((target for target in target_payloads if target["hospital_id"] == "JS001"), target_payloads[0] if target_payloads else {})
     req_payload = {
         'request_id': request_id,
         'ambulance_id': ambulance_id,
@@ -1659,47 +1719,43 @@ def create_emergency_request():
         'ambulance_plate': amb_unit.get('plate', 'DL-01-EM-1081'),
         'ambulance_type': amb_unit.get('type', 'Advanced Life Support (ICU on Wheels)'),
         'crew': amb_unit.get('crew', 'Vikram Singh & Dr. A. Sharma'),
-        'hospital_id': hospital.get('place_id', 'JS001'),
-        'hospital_name': hospital.get('name', 'JS Hospital - Emergency Center'),
-        'hospital_address': hospital.get('address', 'Emergency Expressway Sector 1, Central Medical Zone'),
-        'ambulance_address': amb_unit.get('address', amb_unit.get('location_name', 'K.D. Medical College Campus, Mathura Corridor')),
+        'hospital_id': primary.get('hospital_id', 'JS001'),
+        'hospital_name': primary.get('hospital_name', 'JS Hospital - Emergency Center'),
+        'hospital_address': primary.get('hospital_address'),
+        'ambulance_address': amb_unit.get('address', amb_unit.get('location_name', 'Ambulance GPS location')),
         'patient_name': patient_name,
         'patient_condition': patient_condition,
-        'distance_km': distance_km,
-        'eta_min': eta_min,
-        'eta_text': f"{eta_min} min" if eta_min < 60 else f"{eta_min // 60} hr {eta_min % 60} min",
-        'emergency_bed_available': bool(hospital.get('emergency_bed_available', True)),
-        'emergency_beds_count': hospital.get('emergency_beds_available', 15),
-        'icu_available': bool(hospital.get('icu_available', True)),
-        'icu_beds_count': hospital.get('icu_beds_available', 6),
-        'required_facility_available': bool(hospital.get('required_facility_available', True)),
-        'specialists_available': hospital.get('specialist_available', ["trauma", "cardiology", "neurology"]),
-        'status': 'PENDING',  # PENDING, ACCEPTED, REJECTED, COMPLETED
-        'created_at': datetime.now(timezone.utc).isoformat(),
+        'distance_km': primary.get('distance_km'),
+        'eta_min': primary.get('eta_min'),
+        'eta_text': primary.get('eta_text'),
+        'emergency_bed_available': primary.get('emergency_bed_available'),
+        'emergency_beds_count': primary.get('emergency_beds_count'),
+        'icu_available': primary.get('icu_available'),
+        'icu_beds_count': primary.get('icu_beds_count'),
+        'required_facility_available': primary.get('required_facility_available'),
+        'specialists_available': primary.get('specialists_available', []),
+        'status': 'PENDING',
+        'created_at': now.isoformat(),
+        'response_deadline': deadline.isoformat(),
+        'response_window_seconds': RESPONSE_WINDOW_SECONDS,
         'responded_at': None,
-        'ambulance_location': {
-            'lat': amb_lat,
-            'lng': amb_lng,
-            'speed_kmh': amb_unit.get('speed_kmh', 45)
-        },
-        'hospital_location': {
-            'lat': hosp_lat,
-            'lng': hosp_lng
-        },
-        'route_points': route_points
+        'hospital_targets': target_payloads,
+        'hospital_responses': response_map,
+        'ambulance_location': {'lat': amb_lat, 'lng': amb_lng, 'speed_kmh': amb_unit.get('speed_kmh', 45)},
+        'hospital_location': primary.get('hospital_location'),
+        'route_points': primary.get('route_points', []),
     }
 
-    emergency_requests[request_id] = req_payload
-    active_emergency_request_id = request_id
+    with emergency_state_lock:
+        emergency_requests[request_id] = req_payload
+        active_emergency_request_id = request_id
+        broadcast_socket_event('new_emergency_request', req_payload)
 
-    # Broadcast real-time Socket.IO notification to JS Hospital (Device 2)
-    broadcast_socket_event('new_emergency_request', req_payload)
-
-    print(f"[API] 🚨 Emergency Request Created: {request_id} -> Broadcast to JS Hospital")
+    print(f"[API] 🚨 Emergency Request Created: {request_id} -> Broadcast to JS001 and KS001")
 
     return jsonify({
         'success': True,
-        'message': f"Emergency request sent to {req_payload['hospital_name']}",
+        'message': "Emergency request sent to JS Hospital and KS Hospital. Each hospital has 60 seconds to accept or reject.",
         'data': req_payload
     })
 
@@ -1716,44 +1772,48 @@ def respond_emergency_request():
     request_id = data.get('request_id', active_emergency_request_id)
     response_status = str(data.get('status', 'accepted')).strip().upper()
     rejection_reason = data.get('reason', 'Emergency Department at capacity')
+    hospital_id = data.get('hospital_id', 'JS001')
 
     if not request_id or request_id not in emergency_requests:
         return jsonify({'success': False, 'error': f"Request {request_id} not found"}), 404
 
-    req = emergency_requests[request_id]
+    with emergency_state_lock:
+        req = emergency_requests[request_id]
+        _expire_request(req)
+        response = req.get('hospital_responses', {}).get(hospital_id)
+        if response is None:
+            return jsonify({'success': False, 'error': f"Hospital {hospital_id} was not notified for request {request_id}"}), 403
+        if req.get('expired_at'):
+            return jsonify({'success': False, 'error': 'The 60-second hospital response window has expired', 'data': req}), 409
+        if response['status'] != 'PENDING':
+            return jsonify({'success': True, 'message': f"{hospital_id} already resolved as {response['status']}", 'data': req}), 200
 
-    # Prevent duplicate decisions
-    if req['status'] in ('ACCEPTED', 'REJECTED'):
-        return jsonify({
-            'success': True,
-            'message': f"Request already resolved as {req['status']}",
-            'data': req
-        })
+        now = datetime.now(timezone.utc).isoformat()
+        if response_status in ('ACCEPT', 'ACCEPTED'):
+            response['status'] = 'ACCEPTED'
+            response['reason'] = None
+            event_name = 'emergency_request_accepted'
+            toast_msg = f"✅ {hospital_id} ACCEPTED the emergency request."
+        else:
+            response['status'] = 'REJECTED'
+            response['reason'] = rejection_reason
+            event_name = 'emergency_request_rejected'
+            toast_msg = f"❌ {hospital_id} rejected the emergency request ({rejection_reason})."
+        response['responded_at'] = now
 
-    if response_status in ('ACCEPT', 'ACCEPTED'):
-        req['status'] = 'ACCEPTED'
-        req['rejection_reason'] = None
-        event_name = 'emergency_request_accepted'
-        toast_msg = f"✅ {req['hospital_name']} ACCEPTED the emergency request."
-    else:
-        req['status'] = 'REJECTED'
-        req['rejection_reason'] = rejection_reason
-        event_name = 'emergency_request_rejected'
-        toast_msg = f"❌ {req['hospital_name']} rejected the emergency request ({rejection_reason})."
+        accepted = [key for key, item in req['hospital_responses'].items() if item['status'] == 'ACCEPTED']
+        pending = [item for item in req['hospital_responses'].values() if item['status'] == 'PENDING']
+        req['status'] = 'ACCEPTED' if accepted else ('REJECTED' if not pending else 'PENDING')
+        req['last_response_hospital_id'] = hospital_id
+        req['responded_at'] = now
 
-    req['responded_at'] = datetime.now(timezone.utc).isoformat()
+        response_event = {**req, 'response_hospital_id': hospital_id, 'response_status': response['status'], 'response_reason': response['reason']}
+        broadcast_socket_event(event_name, response_event)
+        broadcast_socket_event('emergency_hospital_response', response_event)
+        broadcast_socket_event('emergency_status_update', response_event)
 
-    # Broadcast real-time Socket.IO event to Ambulance (Device 1)
-    broadcast_socket_event(event_name, req)
-    broadcast_socket_event('emergency_status_update', req)
-
-    print(f"[API] Hospital response for {request_id}: {req['status']} -> Broadcast to Ambulance")
-
-    return jsonify({
-        'success': True,
-        'message': toast_msg,
-        'data': req
-    })
+        print(f"[API] Hospital response for {request_id}: {hospital_id} -> {response['status']}")
+        return jsonify({'success': True, 'message': toast_msg, 'data': req})
 
 
 @api_bp.route('/emergency/active-request', methods=['GET'])
@@ -1761,6 +1821,8 @@ def get_active_emergency_request():
     """Fetch current active emergency request."""
     global active_emergency_request_id
     if active_emergency_request_id and active_emergency_request_id in emergency_requests:
+        with emergency_state_lock:
+            _expire_request(emergency_requests[active_emergency_request_id])
         return jsonify({
             'success': True,
             'has_active': True,
@@ -1776,6 +1838,9 @@ def get_active_emergency_request():
 @api_bp.route('/emergency/requests', methods=['GET'])
 def get_all_emergency_requests():
     """List all emergency requests for triage history."""
+    with emergency_state_lock:
+        for req in emergency_requests.values():
+            _expire_request(req)
     return jsonify({
         'success': True,
         'count': len(emergency_requests),
@@ -1788,8 +1853,13 @@ def update_emergency_ambulance_location():
     """Ambulance live GPS stream -> Relays live location to JS Hospital Dashboard."""
     data = request.get_json(silent=True) or {}
     ambulance_id = data.get('ambulance_id', 'AMB-101')
-    lat = float(data.get('lat', 27.646870))
-    lng = float(data.get('lng', 77.551921))
+    try:
+        lat = float(data['lat'])
+        lng = float(data['lng'])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'Current ambulance latitude and longitude are required.'}), 400
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return jsonify({'success': False, 'error': 'Invalid ambulance coordinates.'}), 400
     speed = float(data.get('speed_kmh', 45))
 
     # Update fleet memory

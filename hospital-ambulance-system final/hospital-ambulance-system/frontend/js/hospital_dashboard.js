@@ -10,16 +10,29 @@
 
 const HospitalDashboard = {
   socket: null,
+  hospitalId: window.location.pathname.toLowerCase().includes('ks-hospital') ? 'KS001' : 'JS001',
+  hospitalName: window.location.pathname.toLowerCase().includes('ks-hospital') ? 'KS Hospital' : 'JS Hospital',
   currentRequest: null,
   requestHistory: [],
   audioCtx: null,
+  countdownTimer: null,
 
   init() {
+    this._configureHospitalIdentity();
     this._initAudioContext();
     this._bindDOMEvents();
     this._initSocketIO();
     this._fetchActiveRequest();
-    console.log('[JS Hospital] Emergency Triage Reception Gateway initialized.');
+    console.log(`[${this.hospitalName}] Emergency Triage Reception Gateway initialized.`);
+  },
+
+  _configureHospitalIdentity() {
+    const brand = document.getElementById('hospital-brand-name');
+    const title = document.getElementById('page-title');
+    if (brand) brand.textContent = this.hospitalName;
+    if (title) title.textContent = `${this.hospitalName} — Emergency Triage Reception Dashboard`;
+    const modalHospital = document.getElementById('modal-hospital-name');
+    if (modalHospital) modalHospital.textContent = `${this.hospitalName} - Emergency Center`;
   },
 
   _initAudioContext() {
@@ -79,6 +92,13 @@ const HospitalDashboard = {
           this._renderQueue();
         });
 
+        this.socket.on('emergency_response_window_expired', (data) => {
+          const response = data?.hospital_responses?.[this.hospitalId];
+          if (!response) return;
+          this._handleIncomingRequest(data);
+          this._closeModal();
+        });
+
         // Sync on reconnect
         this.socket.on('sync_active_emergency', (data) => {
           if (data && data.status === 'PENDING') {
@@ -96,11 +116,14 @@ const HospitalDashboard = {
       const res = await fetch('/api/emergency/active-request');
       const json = await res.json();
       if (json.has_active && json.data) {
-        if (json.data.status === 'PENDING') {
+        const response = json.data.hospital_responses?.[this.hospitalId];
+        if (json.data.status === 'PENDING' || response?.status === 'PENDING') {
           this._handleIncomingRequest(json.data);
         } else {
-          this.currentRequest = json.data;
-          this._addToHistory(json.data);
+          const target = (json.data.hospital_targets || []).find(item => item.hospital_id === this.hospitalId);
+          const scoped = target ? { ...json.data, ...target, status: response?.status || json.data.status } : json.data;
+          this.currentRequest = scoped;
+          this._addToHistory(scoped);
           this._renderQueue();
         }
       }
@@ -108,6 +131,18 @@ const HospitalDashboard = {
   },
 
   _handleIncomingRequest(req) {
+    const target = (req.hospital_targets || []).find(item => item.hospital_id === this.hospitalId);
+    if (req.hospital_targets && !target) return;
+    const response = req.hospital_responses?.[this.hospitalId];
+    if (target && response && response.status !== 'PENDING') {
+      const scoped = { ...req, ...target, status: response.status };
+      this.currentRequest = scoped;
+      this._addToHistory(scoped);
+      this._renderQueue();
+      return;
+    } else if (target) {
+      req = { ...req, ...target, hospital_id: this.hospitalId, hospital_name: target.hospital_name };
+    }
     this.currentRequest = req;
     this._addToHistory(req);
     this._renderQueue();
@@ -156,6 +191,7 @@ const HospitalDashboard = {
       banner.textContent = '';
     }
     if (actions) actions.style.display = 'grid';
+    this._startCountdown(req.response_deadline);
 
     // Open prominent popup modal
     const overlay = document.getElementById('emergency-modal');
@@ -185,18 +221,7 @@ const HospitalDashboard = {
         : `❌ <strong>EMERGENCY REQUEST REJECTED</strong><br><small>Ambulance notified to redirect.</small>`;
     }
 
-    // 1. Emit Socket.IO event to Device 1 (Ambulance)
-    if (this.socket && this.socket.connected) {
-      this.socket.emit('hospital_response', {
-        request_id: requestId,
-        status: reqStatus,
-        hospital_id: 'JS001',
-        hospital_name: 'JS Hospital - Emergency Center',
-        reason: isAccepted ? null : 'Trauma ward at 100% capacity'
-      });
-    }
-
-    // 2. Send REST API response to backend
+    // The REST endpoint is authoritative and enforces the server deadline.
     try {
       const res = await fetch('/api/emergency/respond', {
         method: 'POST',
@@ -204,6 +229,7 @@ const HospitalDashboard = {
         body: JSON.stringify({
           request_id: requestId,
           status: reqStatus,
+          hospital_id: this.hospitalId,
           reason: isAccepted ? null : 'Trauma ward at 100% capacity'
         })
       });
@@ -213,6 +239,10 @@ const HospitalDashboard = {
         this._addToHistory(data.data);
         this._renderQueue();
       }
+      if (res.status === 409) {
+        if (banner) banner.innerHTML = '⏱️ <strong>RESPONSE WINDOW EXPIRED</strong><br><small>The server closed this request after 60 seconds.</small>';
+        if (actions) actions.style.display = 'none';
+      }
     } catch (e) {
       console.error('[JS Hospital] Error posting decision:', e);
     }
@@ -221,6 +251,28 @@ const HospitalDashboard = {
     setTimeout(() => {
       this._closeModal();
     }, 2800);
+  },
+
+  _startCountdown(deadline) {
+    if (this.countdownTimer) clearInterval(this.countdownTimer);
+    const el = document.getElementById('modal-countdown');
+    if (!deadline) return;
+    const update = () => {
+      const remaining = Math.max(0, Math.ceil((Date.parse(deadline) - Date.now()) / 1000));
+      if (el) el.textContent = remaining ? `Response window: ${remaining}s` : 'Response window expired';
+      if (!remaining) {
+        clearInterval(this.countdownTimer);
+        const actions = document.getElementById('modal-actions');
+        const banner = document.getElementById('modal-status-banner');
+        if (actions) actions.style.display = 'none';
+        if (banner) {
+          banner.className = 'modal-status-banner show rejected';
+          banner.innerHTML = '⏱️ <strong>RESPONSE WINDOW EXPIRED</strong><br><small>No further response is accepted by the server.</small>';
+        }
+      }
+    };
+    update();
+    this.countdownTimer = setInterval(update, 250);
   },
 
   _updateAmbulanceLivePosition(data) {
@@ -236,6 +288,7 @@ const HospitalDashboard = {
   },
 
   _closeModal() {
+    if (this.countdownTimer) clearInterval(this.countdownTimer);
     const overlay = document.getElementById('emergency-modal');
     if (overlay) {
       overlay.classList.add('hidden');

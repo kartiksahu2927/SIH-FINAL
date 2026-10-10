@@ -39,6 +39,7 @@ from .emergency_assistant import EMERGENCY_PHONE_NUMBER, get_approved_guidance, 
 from .security import JWT_ALGORITHM, JWT_SECRET, create_access_token, get_current_user, hash_password, rate_limit, require_roles, verify_password
 from .seed import seed_demo_data
 from .services import MapBridge, as_dict, audit, compare_treatment, haversine_km, match_facilities, notify, triage_indicator, utc_iso
+from .nearby import NearbySearchError, discover_osm_hospitals
 from .tinyfish import TinyFishError, is_official_source, normalize_text, tinyfish_client
 from .scheme_quality import sanitize_scheme_candidate, scheme_quality_issue, quarantine_unreliable_schemes
 
@@ -1018,6 +1019,7 @@ MAP_FRONTEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 def hospital_map_shortcut():
     return FileResponse(os.path.join(MAP_FRONTEND_DIR, "hospital.html"))
 
+
 @app.get("/ambulance", include_in_schema=False)
 def ambulance_map_shortcut():
     return FileResponse(os.path.join(MAP_FRONTEND_DIR, "index.html"))
@@ -1214,6 +1216,76 @@ FALLBACK_MAP_HOSPITALS = [
         "accepted": None
     }
 ]
+
+# ---- Verified nearby hospital discovery ----
+@app.get("/api/hospitals/nearby", tags=["facilities"])
+async def nearby_hospital_discovery(
+    latitude: float = Query(..., alias="lat", ge=-90, le=90),
+    longitude: float = Query(..., alias="lng", ge=-180, le=180),
+    radius_km: float = Query(10, ge=1, le=100),
+    include_demo: bool = False,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return genuine nearby OSM hospitals for the explicitly supplied origin.
+
+    The separate map service has a static regional catalog and expands an empty
+    search to unrelated entries.  This exact FastAPI route is registered before
+    the legacy proxy and uses OSM hospital tags without inventing capacity.
+    """
+    requested_radius = min(float(radius_km), 100.0)
+    effective_radius = requested_radius
+    records: list[dict[str, Any]] = []
+    while True:
+        try:
+            records = await discover_osm_hospitals(latitude, longitude, effective_radius)
+        except NearbySearchError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        if records or effective_radius >= 50:
+            break
+        effective_radius = min(50.0, effective_radius * 2)
+
+    if include_demo:
+        for hospital in db.scalars(select(Hospital).where(Hospital.demo_facility.is_(True), Hospital.active.is_(True))).all():
+            if not _valid_coordinates(hospital.latitude, hospital.longitude):
+                continue
+            distance = round(haversine_km(latitude, longitude, float(hospital.latitude), float(hospital.longitude)), 2)
+            if distance > effective_radius:
+                continue
+            records.append({
+                "place_id": hospital.map_place_id or f"mediroute-demo-{hospital.id}",
+                "hospital_id": hospital.map_place_id or hospital.id,
+                "name": hospital.name,
+                "facility_type": "demo_hospital",
+                "address": hospital.address,
+                "latitude": hospital.latitude,
+                "longitude": hospital.longitude,
+                "distance_km": distance,
+                "services": hospital.services or [],
+                "emergency_service_published": True,
+                "phone": hospital.phone,
+                "website": None,
+                "availability_source": "DEMO_CONFIG",
+                "availability_status": "Controlled demo configuration; confirm with the hospital account",
+                "emergency_bed_available": None,
+                "doctor_available": None,
+                "accepted": None,
+                "demo_facility": True,
+                "source": hospital.location_source or "DEMO_CONFIG",
+                "source_url": None,
+            })
+    records.sort(key=lambda item: item["distance_km"])
+    return {
+        "success": True,
+        "origin": {"lat": latitude, "lng": longitude, "source": "explicit_query_coordinates"},
+        "requested_radius_km": requested_radius,
+        "effective_radius_km": effective_radius,
+        "expanded_search": effective_radius != requested_radius,
+        "count": len(records),
+        "hospitals": records,
+        "source": "OpenStreetMap Overpass plus explicitly configured demo facilities" if include_demo else "OpenStreetMap Overpass",
+        "message": "No genuine hospital records were found in the selected radius; no unrelated map markers were substituted." if not records else "Distances are geographic distances from the selected origin. Bed availability and ETA are not inferred from this search.",
+    }
+
 
 # ---- PROXY ROUTES FOR LIVE MAP SYSTEM ----
 @app.api_route("/api/hospitals/live-stream", methods=["GET"])

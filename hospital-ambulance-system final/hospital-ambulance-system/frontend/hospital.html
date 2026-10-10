@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>JS Hospital — Emergency Triage Reception Dashboard (Device 2)</title>
+  <title id="page-title">JS Hospital — Emergency Triage Reception Dashboard</title>
 
   <!-- Google Fonts: Outfit & JetBrains Mono -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -24,8 +24,8 @@
     <div class="topbar-left">
       <div class="hospital-logo">🏥</div>
       <div>
-        <div class="topbar-title">
-          JS Hospital <span class="demo-tag">Emergency Reception • Device 2</span>
+          <div class="topbar-title">
+          <span id="hospital-brand-name">JS Hospital</span> <span class="demo-tag">Emergency Reception • Device 2/3</span>
         </div>
         <div class="topbar-sub">Real-Time Emergency Reception &amp; Triage Gateway</div>
       </div>
@@ -210,7 +210,7 @@
         <div class="detail-table">
           <div class="detail-row">
             <span>Hospital:</span>
-            <span id="modal-hospital-name" class="highlight-green">JS Hospital - Demo Hospital</span>
+           <span id="modal-hospital-name" class="highlight-green">JS Hospital - Emergency Center</span>
           </div>
           <div class="detail-row">
             <span>Patient:</span>
@@ -261,7 +261,9 @@
         </div>
 
         <!-- Decision Status Banner -->
-        <div id="modal-status-banner" class="modal-status-banner"></div>
+          <div id="modal-status-banner" class="modal-status-banner"></div>
+
+        <div id="modal-countdown" style="margin:8px 0; text-align:center; color:#fbbf24; font-family:'JetBrains Mono',monospace; font-weight:700;">Response window: 60s</div>
 
         <!-- Decision Action Buttons -->
         <div id="modal-actions" class="modal-actions">

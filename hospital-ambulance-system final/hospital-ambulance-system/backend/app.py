@@ -4,6 +4,7 @@ app.py — Flask application with Socket.IO Real-Time Engine & 2-Device Demo
 Serves:
   - DEVICE 1 (Ambulance Dashboard): http://<HOST>:5000/ or http://<HOST>:5000/ambulance
   - DEVICE 2 (JS Hospital Dashboard): http://<HOST>:5000/hospital
+  - DEVICE 3 (KS Hospital Dashboard): http://<HOST>:5000/ks-hospital
 Provides:
   - WebSocket/Socket.IO Real-Time Emergency Dispatch
   - REST API routes for hospital eligibility and fleet telemetry
@@ -118,6 +119,15 @@ def serve_hospital_dashboard():
     return send_from_directory(FRONTEND_DIR, 'hospital.html')
 
 
+@app.route('/ks-hospital')
+@app.route('/ks-hospital/')
+def serve_ks_hospital_dashboard():
+    """Same JS Hospital reception implementation with KS identity selected."""
+    response = send_from_directory(FRONTEND_DIR, 'hospital.html')
+    response.headers['X-MediRoute-Hospital-Id'] = 'KS001'
+    return response
+
+
 @app.route('/<path:filename>')
 def serve_frontend(filename):
     """Serve static files (css, js, assets) from frontend directory."""
@@ -150,4 +160,3 @@ if __name__ == '__main__':
     print(f"  [+] Real-Time WebSockets:            ONLINE (Flask-SocketIO)")
     print("=" * 65)
     socketio.run(app, debug=True, port=port, host='0.0.0.0', allow_unsafe_werkzeug=True)
-

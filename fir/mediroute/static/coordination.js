@@ -111,6 +111,11 @@ window.Coordination = (() => {
     refreshTimer = setInterval(refresh, 4000); countdownTimer = setInterval(timer, 250);
     refresh();
   }
+  function renderNearby(results) {
+    const target = document.getElementById('nearby-search-results');
+    if (!target) return;
+    target.innerHTML = results.hospitals?.length ? `<div class="table-wrap"><table><thead><tr><th>Hospital</th><th>Distance</th><th>Location</th><th>Published information</th></tr></thead><tbody>${results.hospitals.map(h => `<tr><td>${esc(h.name)}${h.demo_facility ? ' (Controlled demo)' : ''}</td><td>${Number(h.distance_km).toFixed(2)} km</td><td>${esc(h.address || `${h.latitude}, ${h.longitude}`)}</td><td>${esc(h.services?.join(', ') || 'No services published')}<br><small>${esc(h.availability_status || 'Availability not published')}</small></td></tr>`).join('')}</tbody></table></div>` : `<p class="muted">${esc(results.message || 'No genuine hospitals were found for these coordinates and radius.')}</p>`;
+  }
   document.addEventListener('click', async event => {
     const button = event.target.closest('[data-coord-action],[data-coord-response],[data-coord-status]');
     if (!button) return;
@@ -136,6 +141,15 @@ window.Coordination = (() => {
   });
   document.addEventListener('submit', async event => {
     const form = event.target;
+    if (form.id === 'nearby-search-form') {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(form));
+      try {
+        const result = await api(`/hospitals/nearby?lat=${encodeURIComponent(Number(data.latitude))}&lng=${encodeURIComponent(Number(data.longitude))}&radius_km=${encodeURIComponent(Number(data.radius_km))}`);
+        renderNearby(result);
+      } catch (error) { setStatus(error.message, true); }
+      return;
+    }
     if (!form.matches('.coord-demo-location,#coordination-create')) return;
     event.preventDefault();
     const d = Object.fromEntries(new FormData(form));
@@ -160,8 +174,17 @@ window.Coordination = (() => {
     const config = await api('/coordination/config');
     routeMaxAgeMs = config.route_max_age_seconds * 1000;
     return `${hospital ? '' : `<article class="card"><h3>Hospital destination map</h3><iframe id="coordination-map" class="coord-map" src="/coordination-map.html" title="Authoritative ambulance destination and road route"></iframe></article>
+      <article class="card"><h3>Nearby hospital discovery</h3><p>Enter an explicit selected location. GPS is not silently replaced. Results are limited to OSM records tagged as hospitals; capacity and ETA are not inferred.</p><form id="nearby-search-form"><label>Selected latitude<input name="latitude" type="number" step="any" min="-90" max="90" required></label><label>Selected longitude<input name="longitude" type="number" step="any" min="-180" max="180" required></label><label>Radius (km)<input name="radius_km" type="number" min="1" max="100" value="10" required></label><button type="button" id="kcc-location-button" class="quiet">Use selected KCC College test point</button><button>Search genuine hospitals</button></form><div id="nearby-search-results" role="status"></div></article>
       <article class="card"><h3>Create emergency at pickup</h3><form id="coordination-create"><label>Emergency category / care summary<input name="condition" required maxlength="1000"></label><label>Required service<input name="required_service" placeholder="e.g. trauma"></label>${config.demo_enabled ? '<label><input name="demo" type="checkbox">Explicit controlled demo (simulated facility capacity and chosen pickup)</label><label>Demo pickup latitude<input name="latitude" type="number" step="any" min="-90" max="90" value="27.6100"></label><label>Demo pickup longitude<input name="longitude" type="number" step="any" min="-180" max="180" value="77.6000"></label>' : ''}<p>For a real request, the browser’s current GPS is the pickup location. Location permission is required.</p><button>Create and notify eligible hospitals</button></form></article>`}
       <p id="coordination-nearby" role="status"></p><section id="coordination-list">Loading hospital coordination…</section>`;
   }
+  document.addEventListener('click', event => {
+    if (event.target.id !== 'kcc-location-button') return;
+    const form = document.getElementById('nearby-search-form');
+    if (!form) return;
+    form.latitude.value = '28.4595';
+    form.longitude.value = '77.5000';
+    setStatus('Selected reproducible test point near KCC College, Greater Noida: 28.4595, 77.5000. This is an explicit selection, not a GPS claim.');
+  });
   return {view, bind, refresh, stop};
 })();
