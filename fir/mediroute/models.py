@@ -52,7 +52,77 @@ class Hospital(Timestamped, Base):
     doctors_available: Mapped[int] = mapped_column(Integer, default=0)
     services: Mapped[list] = mapped_column(JSON, default=list)
     map_place_id: Mapped[Optional[str]] = mapped_column(String(120), index=True)
+    demo_facility: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    capabilities_source: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    location_source: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    availability_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class FacilityDiscovery(Timestamped, Base):
+    """A web-researched facility awaiting an authorized human review."""
+
+    __tablename__ = "facility_discoveries"
+    search_location: Mapped[str] = mapped_column(String(255), index=True)
+    requested_facility_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    facility_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    district: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    postal_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    website: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    specialties: Mapped[list] = mapped_column(JSON, default=list)
+    services: Mapped[list] = mapped_column(JSON, default=list)
+    latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    source_url: Mapped[str] = mapped_column(Text)
+    source_urls: Mapped[list] = mapped_column(JSON, default=list)
+    source_evidence: Mapped[list] = mapped_column(JSON, default=list)
+    search_query: Mapped[str] = mapped_column(Text)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    last_checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    verification_status: Mapped[str] = mapped_column(String(40), default="PENDING_VERIFICATION", index=True)
+    duplicate_kind: Mapped[str] = mapped_column(String(40), default="NEW_DISCOVERY", index=True)
+    duplicate_match_id: Mapped[Optional[int]] = mapped_column(ForeignKey("hospitals.id"), nullable=True, index=True)
+    duplicate_score: Mapped[float] = mapped_column(Float, default=0)
+    reviewed_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    approved_hospital_id: Mapped[Optional[int]] = mapped_column(ForeignKey("hospitals.id"), nullable=True, index=True)
+
+
+class HealthcareScheme(Timestamped, Base):
+    """Source-backed government scheme information and its review state."""
+
+    __tablename__ = "healthcare_schemes"
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    normalized_name: Mapped[str] = mapped_column(String(255), index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    government_authority: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    classification: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    geographic_coverage: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    benefits: Mapped[list] = mapped_column(JSON, default=list)
+    eligibility: Mapped[list] = mapped_column(JSON, default=list)
+    beneficiary_categories: Mapped[list] = mapped_column(JSON, default=list)
+    income_conditions: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    required_documents: Mapped[list] = mapped_column(JSON, default=list)
+    application_process: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    official_application_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    official_information_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    helpline: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    source_urls: Mapped[list] = mapped_column(JSON, default=list)
+    source_evidence: Mapped[list] = mapped_column(JSON, default=list)
+    search_query: Mapped[str] = mapped_column(Text)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    last_checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    verification_status: Mapped[str] = mapped_column(String(40), default="PENDING_REVIEW", index=True)
+    active_status: Mapped[str] = mapped_column(String(40), default="REVIEW_REQUIRED", index=True)
+    duplicate_of_id: Mapped[Optional[int]] = mapped_column(ForeignKey("healthcare_schemes.id"), nullable=True, index=True)
+    reviewed_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class Facility(Timestamped, Base):
@@ -230,6 +300,42 @@ class EmergencyRequest(Timestamped, Base):
     status: Mapped[str] = mapped_column(String(50), default="REQUESTED", index=True)
     details: Mapped[dict] = mapped_column(JSON, default=dict)
     map_request_id: Mapped[Optional[str]] = mapped_column(String(120), index=True)
+    state_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class EmergencyHospitalResponse(Timestamped, Base):
+    """One authoritative, authenticated hospital response for an emergency."""
+
+    __tablename__ = "emergency_hospital_responses"
+    emergency_id: Mapped[int] = mapped_column(ForeignKey("emergency_requests.id"), index=True)
+    hospital_id: Mapped[int] = mapped_column(ForeignKey("hospitals.id"), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)
+    notified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    response_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    responded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    distance_km: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    eligibility: Mapped[dict] = mapped_column(JSON, default=dict)
+    response_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    responded_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    __table_args__ = (UniqueConstraint("emergency_id", "hospital_id", name="uq_emergency_hospital_response"),)
+
+
+class EmergencyRouteDecision(Timestamped, Base):
+    """Auditable route comparison and destination assignment history."""
+
+    __tablename__ = "emergency_route_decisions"
+    emergency_id: Mapped[int] = mapped_column(ForeignKey("emergency_requests.id"), index=True)
+    assignment_version: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    previous_hospital_id: Mapped[Optional[int]] = mapped_column(ForeignKey("hospitals.id"), nullable=True)
+    selected_hospital_id: Mapped[Optional[int]] = mapped_column(ForeignKey("hospitals.id"), nullable=True)
+    reason: Mapped[str] = mapped_column(String(255))
+    ambulance_latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ambulance_longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    previous_route: Mapped[dict] = mapped_column(JSON, default=dict)
+    selected_route: Mapped[dict] = mapped_column(JSON, default=dict)
+    comparison: Mapped[dict] = mapped_column(JSON, default=dict)
+    route_data_timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class LocationEvent(Timestamped, Base):
@@ -239,6 +345,8 @@ class LocationEvent(Timestamped, Base):
     latitude: Mapped[float] = mapped_column(Float)
     longitude: Mapped[float] = mapped_column(Float)
     speed_kmh: Mapped[Optional[float]] = mapped_column(Float)
+    observed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    source: Mapped[str] = mapped_column(String(30), default="GPS", nullable=False)
 
 
 class Notification(Timestamped, Base):
@@ -394,4 +502,3 @@ class EmergencySafetyEvent(Timestamped, Base):
     action: Mapped[str] = mapped_column(String(160))
     detail: Mapped[dict] = mapped_column(JSON, default=dict)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-

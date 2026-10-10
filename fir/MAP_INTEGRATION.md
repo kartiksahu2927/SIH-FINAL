@@ -1,5 +1,14 @@
 # Read-only map integration
 
+## Authoritative hospital coordination extension
+
+The new authenticated coordination workflow reuses the protected map's
+`map.js` renderer read-only and its OSRM road provider. MediRoute's embedded
+map updates through a version-checked host adapter. The standalone Flask
+service does not yet expose a versioned destination-update endpoint; see
+[EMERGENCY_COORDINATION.md](EMERGENCY_COORDINATION.md) for the proposed compatible
+contract and full demo. The following describes the earlier legacy relay.
+
 MediRoute does not copy, import, rewrite, or modify `hospital-ambulance-system final`. The supplied archive baseline SHA-256 is:
 
 `39EB30E71F8A7A24FC270D3D21F9B75707ED406CCF286F3665D3458FFA73C3B6`

@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field
@@ -79,12 +80,29 @@ class EmergencyIn(BaseModel):
     condition: str = Field(min_length=2, max_length=1000)
     patient_name: str | None = Field(default=None, max_length=150)
     required_service: str | None = Field(default=None, max_length=160)
+    origin: Literal["PICKUP", "AMBULANCE"] = "PICKUP"
+    demo: bool = False
+    clinical_destination_locked: bool = False
 
 
 class LocationIn(BaseModel):
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
     speed_kmh: float | None = Field(default=None, ge=0, le=300)
+    observed_at: datetime | None = None
+    source: Literal["GPS", "DEMO"] = "GPS"
+
+
+class EmergencyDispatchIn(BaseModel):
+    radius_km: float | None = Field(default=None, ge=1, le=250)
+    required_service: str | None = Field(default=None, max_length=160)
+    origin: Literal["PICKUP", "AMBULANCE"] = "PICKUP"
+
+
+class EmergencyHospitalResponseIn(BaseModel):
+    model_config = {"extra": "forbid"}
+    status: Literal["ACCEPTED", "DECLINED", "WITHDRAWN"]
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class DiagnosticIn(BaseModel):
@@ -186,6 +204,31 @@ class AIAnalysisIn(BaseModel):
     task: Literal["summarize_record", "classify_complaint", "prioritize_follow_up"]
 
 
+class FacilityDiscoveryIn(BaseModel):
+    location: str = Field(min_length=2, max_length=255)
+    facility_type: str | None = Field(default=None, max_length=100)
+    force_refresh: bool = False
+
+
+class DiscoveryReviewIn(BaseModel):
+    status: Literal["VERIFIED", "REJECTED", "DUPLICATE"]
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class SchemeDiscoveryIn(BaseModel):
+    keyword: str | None = Field(default=None, max_length=200)
+    state: str | None = Field(default=None, max_length=120)
+    category: str | None = Field(default=None, max_length=120)
+    beneficiary: str | None = Field(default=None, max_length=120)
+    force_refresh: bool = False
+
+
+class SchemeReviewIn(BaseModel):
+    status: Literal["APPROVED", "REJECTED", "DUPLICATE", "REVIEW_REQUIRED"]
+    active_status: Literal["ACTIVE", "INACTIVE", "REVIEW_REQUIRED"] | None = None
+    note: str | None = Field(default=None, max_length=2000)
+
+
 class EmergencySessionIn(BaseModel):
     emergency_request_id: int
     language: str = Field(default="en", max_length=10)
@@ -195,4 +238,3 @@ class EmergencyMessageIn(BaseModel):
     session_id: int
     message: str = Field(min_length=1, max_length=2000)
     language: str | None = Field(default=None, max_length=10)
-

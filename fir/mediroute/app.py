@@ -1,37 +1,46 @@
 from __future__ import annotations
 
 import os
+import re
+import asyncio
+import logging
+from copy import deepcopy
+from contextlib import suppress
+from difflib import SequenceMatcher
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import models
-from .db import Base, engine, get_db
+from .db import Base, engine, ensure_compatibility_schema, get_db
 from .models import (Ambulance, AmbulanceDriver, Appointment, AppointmentSlot, AuditLog, Complaint, ComplaintResponse, Consultation,
                      DiagnosticOrder, DiagnosticReport, DiagnosticService, Doctor, EmergencyAssistantMessage, EmergencyAssistantSession,
-                     EmergencyGuidance, EmergencyRequest, EmergencySafetyEvent, Escalation, FollowUp, Hospital,
-                     LocationEvent, MedicalRecord, Medicine, MedicineInventory, Notification, NotificationPreference, PatientFeedback,
-                     PatientProfile, PolicySetting, Prescription, QualityIndicator, QueueEntry, Rating, Referral, Teleconsultation,
-                     TreatmentComparison, TreatmentRecord, User, Visit, Vital)
+                      EmergencyGuidance, EmergencyHospitalResponse, EmergencyRequest, EmergencyRouteDecision, EmergencySafetyEvent, Escalation, FollowUp, Hospital,
+                      FacilityDiscovery, HealthcareScheme, LocationEvent, MedicalRecord, Medicine, MedicineInventory, Notification,
+                      NotificationPreference, PatientFeedback, PatientProfile, PolicySetting, Prescription, QualityIndicator, QueueEntry,
+                      Rating, Referral, Teleconsultation, TreatmentComparison, TreatmentRecord, User, Visit, Vital)
 from .schemas import (AIAnalysisIn, AppointmentIn, AppointmentSlotIn, ComplaintIn, ComplaintResponseIn, DiagnosticIn, DiagnosticServiceIn,
-                      DiagnosticStatusIn, EmergencyIn, EmergencyMessageIn, EmergencySessionIn, FeedbackIn, FollowUpIn, InventoryIn, LocationIn, LoginIn, NotificationPreferenceIn,
-                      PatientProfileIn, PolicyIn, RatingIn, ReferralIn, ReferralStatusIn, RegisterIn, TeleconsultationIn, TreatmentIn, TriageIn)
+                      DiagnosticStatusIn, EmergencyIn, EmergencyDispatchIn, EmergencyHospitalResponseIn, EmergencyMessageIn, EmergencySessionIn, FeedbackIn, FollowUpIn, InventoryIn, LocationIn, LoginIn, NotificationPreferenceIn,
+                      PatientProfileIn, PolicyIn, RatingIn, ReferralIn, ReferralStatusIn, RegisterIn, SchemeDiscoveryIn, SchemeReviewIn,
+                      DiscoveryReviewIn, FacilityDiscoveryIn, TeleconsultationIn, TreatmentIn, TriageIn)
 from .ai import get_ai_provider
 from .emergency_assistant import EMERGENCY_PHONE_NUMBER, get_approved_guidance, process_emergency_message
 from .security import JWT_ALGORITHM, JWT_SECRET, create_access_token, get_current_user, hash_password, rate_limit, require_roles, verify_password
 from .seed import seed_demo_data
 from .services import MapBridge, as_dict, audit, compare_treatment, haversine_km, match_facilities, notify, triage_indicator, utc_iso
+from .tinyfish import TinyFishError, is_official_source, normalize_text, tinyfish_client
+from .scheme_quality import sanitize_scheme_candidate, scheme_quality_issue, quarantine_unreliable_schemes
 
 
 
@@ -48,10 +57,10 @@ class ConnectionManager:
 
     async def send(self, user_id: int, event: dict) -> None:
         stale = []
-        for connection in self.connections[user_id]:
+        for connection in list(self.connections[user_id]):
             try:
                 await connection.send_json(event)
-            except RuntimeError:
+            except (RuntimeError, WebSocketDisconnect, OSError):
                 stale.append(connection)
         for connection in stale:
             self.connections[user_id].discard(connection)
@@ -59,17 +68,216 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 bridge = MapBridge()
+TERMINAL_EMERGENCY_STATUSES = {"ARRIVED", "UNDER_TREATMENT", "COMPLETED", "CANCELLED"}
+
+
+def _configured_float(name: str, default: float, lower: float, upper: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, lower), upper)
+
+
+def _configured_int(name: str, default: int, lower: int, upper: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, lower), upper)
+
+
+def _response_window_seconds() -> int:
+    return 60
+
+
+def _search_radius_km() -> float:
+    return _configured_float("EMERGENCY_SEARCH_RADIUS_KM", 30, 1, 250)
+
+
+def _max_search_radius_km() -> float:
+    return max(_search_radius_km(), _configured_float("EMERGENCY_MAX_SEARCH_RADIUS_KM", 100, 1, 500))
+
+
+def _gps_max_age_seconds() -> int:
+    return _configured_int("AMBULANCE_GPS_MAX_AGE_SECONDS", 120, 10, 3600)
+
+
+def _reroute_min_time_saving_minutes() -> float:
+    return _configured_float("REROUTE_MIN_TIME_SAVING_MINUTES", 5, 0, 120)
+
+
+def _reroute_min_distance_saving_km() -> float:
+    return _configured_float("REROUTE_MIN_DISTANCE_SAVING_KM", 2, 0, 100)
+
+
+def _near_destination_minutes() -> float:
+    return _configured_float("REROUTE_NEAR_DESTINATION_MINUTES", 3, 0, 60)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _valid_coordinates(latitude: Any, longitude: Any) -> bool:
+    try:
+        return -90 <= float(latitude) <= 90 and -180 <= float(longitude) <= 180
+    except (TypeError, ValueError):
+        return False
+
+
+def _latest_ambulance_location(db: Session, emergency: EmergencyRequest) -> dict | None:
+    if not emergency.ambulance_id:
+        return None
+    event = db.scalar(
+        select(LocationEvent)
+        .where(LocationEvent.emergency_id == emergency.id, LocationEvent.ambulance_id == emergency.ambulance_id)
+        .order_by(LocationEvent.created_at.desc())
+        .limit(1)
+    )
+    if not event or not _valid_coordinates(event.latitude, event.longitude):
+        return None
+    if event.source == "LEGACY" or (event.source == "DEMO" and not (emergency.details or {}).get("demo")):
+        return None
+    timestamp = _as_utc(event.observed_at or event.created_at)
+    if not timestamp or (datetime.now(timezone.utc) - timestamp).total_seconds() > _gps_max_age_seconds():
+        return None
+    return {"latitude": float(event.latitude), "longitude": float(event.longitude), "speed_kmh": event.speed_kmh, "at": timestamp.isoformat(), "source": event.source, "event_id": event.id}
+
+
+def _emergency_origin(emergency: EmergencyRequest) -> tuple[float, float] | None:
+    details = emergency.details or {}
+    latitude, longitude = details.get("latitude"), details.get("longitude")
+    return (float(latitude), float(longitude)) if _valid_coordinates(latitude, longitude) else None
+
+
+def _hospital_services(hospital: Hospital) -> set[str]:
+    return {str(item).strip().casefold() for item in (hospital.services or []) if str(item).strip()}
+
+
+def _hospital_eligibility(hospital: Hospital, required_service: str | None) -> tuple[bool, str]:
+    if not hospital.active or not hospital.location_source or not _valid_coordinates(hospital.latitude, hospital.longitude):
+        return False, "Hospital location is unavailable or the facility is inactive"
+    reliable = hospital.demo_facility or (hospital.availability_checked_at and (datetime.now(timezone.utc) - _as_utc(hospital.availability_checked_at)).total_seconds() <= _configured_int("HOSPITAL_AVAILABILITY_MAX_AGE_SECONDS", 300, 30, 3600))
+    if reliable and hospital.emergency_available <= 0:
+        return False, "No declared emergency availability"
+    required = (required_service or "").strip().casefold()
+    if required and required not in _hospital_services(hospital):
+        return False, f"Required service is not declared: {required_service}"
+    return True, "Declared care capability; hospital must confirm capacity when accepting"
+
+
+def _nearby_coordination_hospitals(db: Session, latitude: float, longitude: float, required_service: str | None, requested_radius: float | None = None, demo: bool = False) -> tuple[list[dict], float]:
+    radius = requested_radius or _search_radius_km()
+    radius = min(max(radius, 1), _max_search_radius_km())
+    all_matches: list[dict] = []
+    for hospital in db.scalars(select(Hospital).where(Hospital.active.is_(True))).all():
+        if hospital.demo_facility and not demo:
+            continue
+        if not hospital.location_source:
+            continue
+        if not _valid_coordinates(hospital.latitude, hospital.longitude):
+            continue
+        distance = round(haversine_km(latitude, longitude, float(hospital.latitude), float(hospital.longitude)), 2)
+        eligible, reason = _hospital_eligibility(hospital, required_service)
+        all_matches.append({
+            "hospital_id": hospital.id,
+            "map_place_id": hospital.map_place_id,
+            "name": hospital.name,
+            "latitude": float(hospital.latitude),
+            "longitude": float(hospital.longitude),
+            "distance_km": distance,
+            "emergency_available": hospital.emergency_available,
+            "beds_available": hospital.beds_available,
+            "doctors_available": hospital.doctors_available,
+            "services": hospital.services or [],
+            "demo_facility": bool(hospital.demo_facility),
+            "capabilities_source": hospital.capabilities_source,
+            "location_source": hospital.location_source,
+            "availability_checked_at": _as_utc(hospital.availability_checked_at).isoformat() if hospital.availability_checked_at else None,
+            "availability_source": "DEMO_CONFIG" if hospital.demo_facility else ("HOSPITAL_REPORTED" if hospital.availability_checked_at else "UNKNOWN"),
+            "eligible": eligible,
+            "eligibility_reason": reason,
+        })
+    all_matches.sort(key=lambda item: (not item["eligible"], item["distance_km"], -item["emergency_available"]))
+    eligible = [item for item in all_matches if item["eligible"] and item["distance_km"] <= radius]
+    while not eligible and radius < _max_search_radius_km():
+        radius = min(_max_search_radius_km(), radius * 2)
+        eligible = [item for item in all_matches if item["eligible"] and item["distance_km"] <= radius]
+    return eligible, radius
+
+
+def _response_payload(response: EmergencyHospitalResponse, hospital: Hospital, emergency: EmergencyRequest) -> dict:
+    details = emergency.details or {}
+    return {
+        **as_dict(response),
+        "hospital_name": f"JS Hospital (Demo) — {hospital.name}" if hospital.map_place_id == "JS001" and not hospital.name.startswith("JS Hospital") else hospital.name,
+        "hospital_map_place_id": hospital.map_place_id,
+        "hospital_latitude": hospital.latitude,
+        "hospital_longitude": hospital.longitude,
+        "hospital_services": hospital.services or [],
+        "demo_facility": bool(hospital.demo_facility),
+        "emergency_available": hospital.emergency_available,
+        "availability_source": "DEMO_CONFIG" if hospital.demo_facility else "HOSPITAL_REPORTED" if hospital.availability_checked_at else "UNKNOWN",
+        "availability_checked_at": hospital.availability_checked_at,
+        "dispatch_deadline": details.get("response_deadline"),
+        "current_assigned_hospital_id": emergency.hospital_id,
+        "emergency_status": emergency.status,
+    }
+
+
+def _coordination_payload(db: Session, emergency: EmergencyRequest, user: User | None = None) -> dict:
+    responses = db.scalars(select(EmergencyHospitalResponse).where(EmergencyHospitalResponse.emergency_id == emergency.id).order_by(EmergencyHospitalResponse.notified_at.asc())).all()
+    hospitals = {hospital.id: hospital for hospital in db.scalars(select(Hospital).where(Hospital.id.in_([item.hospital_id for item in responses]))).all()} if responses else {}
+    route_history = db.scalars(select(EmergencyRouteDecision).where(EmergencyRouteDecision.emergency_id == emergency.id).order_by(EmergencyRouteDecision.created_at.asc())).all()
+    emergency_data = as_dict(emergency)
+    emergency_data["details"] = deepcopy(emergency.details or {})
+    route = emergency_data["details"].get("current_route")
+    if route and route.get("available"):
+        timestamp = route.get("route_data_timestamp")
+        if not _latest_ambulance_location(db, emergency) or not timestamp or (datetime.now(timezone.utc) - _as_utc(datetime.fromisoformat(timestamp))).total_seconds() > _configured_int("ROUTE_MAX_AGE_SECONDS", 30, 5, 300):
+            route.update({"available": False, "limitation": "GPS or route estimate is stale; reassessment required"})
+    if user and user.role == "HOSPITAL":
+        emergency_data.pop("patient_id", None)
+        emergency_data["details"] = {key: value for key, value in emergency_data["details"].items() if key in {"condition", "required_service", "latitude", "longitude", "origin_source", "demo", "dispatch_at", "response_deadline", "assignment_version", "current_route", "last_assignment_reason", "assignment_status", "escalation", "clinical_destination_locked", "clinical_hospital_id"}}
+        responses = [item for item in responses if item.hospital_id == user.hospital_id]
+        route_history = []
+    return {
+        **emergency_data,
+        "emergency": emergency_data,
+        "responses": [_response_payload(item, hospitals[item.hospital_id], emergency) for item in responses if item.hospital_id in hospitals],
+        "route_history": [as_dict(item) for item in route_history],
+        "current_location": _latest_ambulance_location(db, emergency),
+        "response_window_seconds": _response_window_seconds(),
+        "server_time": utc_iso(),
+        "demo_enabled": os.getenv("MEDIROUTE_DEMO_COORDINATION", "false").lower() == "true",
+    }
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    ensure_compatibility_schema(engine)
     db = next(get_db())
     try:
         seed_demo_data(db)
+        # Existing databases may contain records created before source-quality
+        # checks were added.  Quarantine them for review without rewriting the
+        # source name or changing any database relationships.
+        quarantine_unreliable_schemes(db)
     finally:
         db.close()
-    yield
+    worker = asyncio.create_task(coordination_worker())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
 
 
 app = FastAPI(title="MediRoute API", version="1.0.0", description="Role-based rural healthcare and emergency-care platform.", lifespan=lifespan)
@@ -113,6 +321,133 @@ def ensure_hospital_scope(user: User, hospital_id: int) -> None:
         raise HTTPException(403, "You can only access your own facility's records")
 
 
+def _tinyfish_http_exception(error: TinyFishError) -> HTTPException:
+    """Expose an actionable provider error without leaking provider credentials."""
+    if error.code == "NOT_CONFIGURED":
+        code = status.HTTP_503_SERVICE_UNAVAILABLE
+    elif error.code == "TIMEOUT":
+        code = status.HTTP_504_GATEWAY_TIMEOUT
+    elif error.code.startswith("HTTP_429") or error.code in {"DAILY_LIMIT_EXCEEDED", "RATE_LIMIT_EXCEEDED"}:
+        code = status.HTTP_429_TOO_MANY_REQUESTS
+    else:
+        code = status.HTTP_502_BAD_GATEWAY
+    return HTTPException(status_code=code, detail=str(error))
+
+
+def _cooldown_seconds() -> int:
+    try:
+        configured = int(os.getenv("TINYFISH_SEARCH_COOLDOWN_SECONDS", "900"))
+    except (TypeError, ValueError):
+        configured = 900
+    return min(max(configured, 60), 86400)
+
+
+def _phone_digits(value: str | None) -> str:
+    return re.sub(r"\D", "", value or "")[-10:]
+
+
+def _address_tokens(value: str | None) -> set[str]:
+    return {token for token in normalize_text(value).split() if len(token) > 2}
+
+
+def _facility_duplicate(db: Session, candidate: dict[str, Any]) -> tuple[str, int | None, float]:
+    """Find likely existing records without changing the trusted directory."""
+    candidate_name = normalize_text(candidate.get("name"))
+    candidate_phone = _phone_digits(candidate.get("phone"))
+    candidate_address = _address_tokens(candidate.get("address"))
+    candidate_postal = str(candidate.get("postal_code") or "")
+    best_id, best_score = None, 0.0
+    for hospital in db.scalars(select(Hospital)).all():
+        score = 0.0
+        existing_name = normalize_text(hospital.name)
+        if candidate_name and existing_name:
+            similarity = SequenceMatcher(None, candidate_name, existing_name).ratio()
+            score = max(score, 0.92 if candidate_name == existing_name else similarity * 0.72)
+        if candidate_phone and candidate_phone == _phone_digits(hospital.phone):
+            score = max(score, 0.96)
+        existing_address = _address_tokens(hospital.address)
+        if candidate_address and existing_address:
+            overlap = len(candidate_address & existing_address) / max(1, len(candidate_address | existing_address))
+            score = max(score, min(0.9, overlap * 0.9))
+        if candidate_postal and candidate_postal in (hospital.address or ""):
+            score = max(score, 0.78)
+        if None not in (candidate.get("latitude"), candidate.get("longitude"), hospital.latitude, hospital.longitude):
+            distance = haversine_km(float(candidate["latitude"]), float(candidate["longitude"]), float(hospital.latitude), float(hospital.longitude))
+            if distance <= 0.5:
+                score = max(score, 0.88)
+        if score > best_score:
+            best_id, best_score = hospital.id, score
+    if best_id is None or best_score < 0.55:
+        return "NEW_DISCOVERY", None, round(best_score, 3)
+    if best_score >= 0.85:
+        return "ALREADY_EXISTS", best_id, round(best_score, 3)
+    return "POTENTIAL_DUPLICATE", best_id, round(best_score, 3)
+
+
+def _scheme_query(payload: SchemeDiscoveryIn) -> str:
+    parts = ["government healthcare scheme", payload.keyword or "health benefits", payload.state or "India", payload.category or "", payload.beneficiary or "", "eligibility benefits application"]
+    return " ".join(part for part in parts if part).strip()
+
+
+def _scheme_search_blob(item: HealthcareScheme) -> str:
+    """Build the searchable text from every persisted, source-backed field."""
+    values = [
+        item.name,
+        item.description,
+        item.government_authority,
+        item.classification,
+        item.geographic_coverage,
+        item.income_conditions,
+        item.application_process,
+        item.helpline,
+        *(item.benefits or []),
+        *(item.eligibility or []),
+        *(item.beneficiary_categories or []),
+        *(item.required_documents or []),
+    ]
+    return " ".join(str(value or "") for value in values).casefold()
+
+
+def _scheme_stats(db: Session, privileged: bool) -> dict:
+    records = db.scalars(select(HealthcareScheme)).all()
+    approved = [item for item in records if item.verification_status == "APPROVED"
+                and item.active_status == "ACTIVE" and not scheme_quality_issue(item)]
+    refreshes = db.scalars(
+        select(AuditLog).where(AuditLog.action == "TINYFISH_SCHEME_DISCOVERY").order_by(AuditLog.created_at.desc())
+    ).all()
+    latest_refresh = next(
+        (item.created_at for item in refreshes if isinstance(item.detail, dict)
+         and item.detail.get("source") == "tinyfish_search_and_fetch"),
+        None,
+    )
+    result = {
+        "approved_count": len(approved),
+        "last_successful_refresh": latest_refresh,
+        "last_checked_at": max((item.last_checked_at for item in approved), default=None),
+    }
+    if privileged:
+        result["pending_count"] = sum(item.verification_status in {"PENDING_REVIEW", "REVIEW_REQUIRED"} for item in records)
+    return result
+
+
+def _merge_unique(existing: list | None, incoming: list | None) -> list:
+    values = list(existing or [])
+    for value in incoming or []:
+        if value not in values:
+            values.append(value)
+    return values
+
+
+def _facility_payload(item: FacilityDiscovery) -> dict:
+    return as_dict(item)
+
+
+def _scheme_payload(item: HealthcareScheme) -> dict:
+    issue = scheme_quality_issue(item)
+    payload = sanitize_scheme_candidate(as_dict(item))
+    return {**payload, "display_name": None if issue else item.name, "data_quality_issue": issue}
+
+
 def safe_user(user: User) -> dict:
     return {"id": user.id, "email": user.email, "full_name": user.full_name, "role": user.role, "language": user.language, "hospital_id": user.hospital_id}
 
@@ -124,7 +459,399 @@ async def persist_notice(db: Session, user_id: int, title: str, body: str, kind:
         return
     notify(db, user_id, title, body, kind, reference)
     db.flush()
-    await manager.send(user_id, {"event": "notification", "title": title, "body": body, "kind": kind, "reference": reference or {}})
+    if kind != "EMERGENCY":
+        await manager.send(user_id, {"event": "notification", "title": title, "body": body, "kind": kind, "reference": reference or {}})
+
+
+def _claim_emergency(db: Session, emergency: EmergencyRequest) -> None:
+    """Database compare-and-swap: works across tabs, threads and workers.
+
+    Transactions using this claim do not await network I/O. Every response,
+    location, lifecycle and assignment mutation advances the same revision.
+    """
+    version = emergency.state_version
+    result = db.execute(update(EmergencyRequest).where(EmergencyRequest.id == emergency.id, EmergencyRequest.state_version == version).values(state_version=version + 1).execution_options(synchronize_session=False))
+    if result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(409, "Emergency changed concurrently; reload its current state and retry")
+    db.refresh(emergency)
+
+
+def _scope_emergency(db: Session, emergency: EmergencyRequest, user: User) -> None:
+    allowed = user.role in {"ADMIN", "GOVERNMENT_AUTHORITY"}
+    if user.role == "PATIENT":
+        patient = db.scalar(select(PatientProfile).where(PatientProfile.user_id == user.id))
+        allowed = bool(patient and patient.id == emergency.patient_id)
+    elif user.role == "AMBULANCE_DRIVER":
+        driver = db.scalar(select(AmbulanceDriver).where(AmbulanceDriver.user_id == user.id))
+        allowed = bool(driver and driver.ambulance_id and driver.ambulance_id == emergency.ambulance_id)
+    elif user.role == "HOSPITAL":
+        allowed = emergency.hospital_id == user.hospital_id or bool(db.scalar(select(EmergencyHospitalResponse.id).where(EmergencyHospitalResponse.emergency_id == emergency.id, EmergencyHospitalResponse.hospital_id == user.hospital_id)))
+    if not allowed:
+        raise HTTPException(403, "You are not involved in this emergency")
+
+
+def _coordination_notice(db: Session, emergency: EmergencyRequest, title: str, body: str, event: str = "emergency_coordination_updated") -> None:
+    hospital_ids = db.scalars(select(EmergencyHospitalResponse.hospital_id).where(EmergencyHospitalResponse.emergency_id == emergency.id)).all()
+    users = set(db.scalars(select(User.id).where(User.hospital_id.in_(hospital_ids), User.role == "HOSPITAL", User.active.is_(True))).all())
+    users.update(db.scalars(select(AmbulanceDriver.user_id).where(AmbulanceDriver.ambulance_id == emergency.ambulance_id)).all() if emergency.ambulance_id else [])
+    if emergency.patient_id:
+        patient = db.get(PatientProfile, emergency.patient_id)
+        if patient:
+            users.add(patient.user_id)
+    if event == "emergency_escalation":
+        users.update(db.scalars(select(User.id).where(User.role == "ADMIN", User.active.is_(True))).all())
+    for user_id in users:
+        notify(db, user_id, title, body, "EMERGENCY", {"emergency_id": emergency.id, "state_version": emergency.state_version, "assignment_version": (emergency.details or {}).get("assignment_version", 0), "event": event})
+
+
+def _escalate_emergency(db: Session, emergency: EmergencyRequest, reason: str) -> None:
+    details = dict(emergency.details or {})
+    if details.get("escalation") == reason:
+        return
+    details["escalation"] = reason
+    details["assignment_status"] = "DISPATCHER_REVIEW_REQUIRED"
+    details["timeline"] = [*(details.get("timeline") or []), {"status": "DISPATCHER_REVIEW_REQUIRED", "at": utc_iso(), "reason": reason}]
+    emergency.details = details
+    audit(db, None, "EMERGENCY_ESCALATION", "emergency", {"emergency_id": emergency.id, "reason": reason})
+    _coordination_notice(db, emergency, "Emergency needs dispatcher review", f"Emergency #{emergency.id}: {reason} Contact emergency dispatch on {EMERGENCY_PHONE_NUMBER}.", "emergency_escalation")
+
+
+def _deadline_from_details(emergency: EmergencyRequest) -> datetime | None:
+    value = (emergency.details or {}).get("response_deadline")
+    if not value:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _expire_response_window(db: Session, emergency: EmergencyRequest) -> bool:
+    deadline = _deadline_from_details(emergency)
+    if not deadline or datetime.now(timezone.utc) < deadline:
+        return False
+    changed = False
+    responses = db.scalars(select(EmergencyHospitalResponse).where(EmergencyHospitalResponse.emergency_id == emergency.id)).all()
+    if (emergency.details or {}).get("initial_window_closed"):
+        return False
+    _claim_emergency(db, emergency)
+    emergency.details = {**(emergency.details or {}), "initial_window_closed": True}
+    changed = True
+    now = datetime.now(timezone.utc)
+    for response in responses:
+        if response.status == "PENDING":
+            response.status = "TIMED_OUT"
+            response.response_note = "No response received before the initial response deadline."
+            changed = True
+    if changed:
+        accepted = any(item.status == "ACCEPTED" for item in responses)
+        if not accepted and responses and all(item.status in {"DECLINED", "TIMED_OUT", "WITHDRAWN"} for item in responses):
+            if emergency.status not in {"ARRIVED", "UNDER_TREATMENT", "COMPLETED", "CANCELLED"}:
+                emergency.status = "NO_ACCEPTANCE"
+                details = dict(emergency.details or {})
+                details["timeline"] = [*(details.get("timeline", [])), {"status": "NO_ACCEPTANCE", "at": utc_iso(), "reason": "No eligible hospital accepted within the initial response window."}]
+                emergency.details = details
+                _escalate_emergency(db, emergency, "No suitable hospital accepted within 60 seconds.")
+        _coordination_notice(db, emergency, "Hospital response window ended", f"Initial response window for emergency #{emergency.id} has ended.")
+    return changed
+
+
+async def coordination_worker():
+    """Durable notification fanout and deadline recovery, including reconnects.
+
+    Each worker fans out committed DB notifications to its own existing socket
+    connections; no second messaging system or in-memory deadline authority.
+    """
+    db = next(get_db())
+    try:
+        cursor = db.scalar(select(func.max(Notification.id))) or 0
+    finally:
+        db.close()
+    while True:
+        await asyncio.sleep(0.5)
+        db = next(get_db())
+        try:
+            for emergency in db.scalars(select(EmergencyRequest).where(EmergencyRequest.status.notin_(TERMINAL_EMERGENCY_STATUSES))).all():
+                try:
+                    _expire_response_window(db, emergency)
+                    db.commit()
+                except HTTPException:
+                    db.rollback()
+            notices = db.scalars(select(Notification).where(Notification.id > cursor).order_by(Notification.id)).all()
+            for notice in notices:
+                cursor = notice.id
+                if notice.kind == "EMERGENCY":
+                    await manager.send(notice.user_id, {"event": notice.reference.get("event", "emergency_coordination_updated"), "title": notice.title, "body": notice.body, "kind": notice.kind, "reference": notice.reference})
+        except Exception:
+            db.rollback()
+            logging.exception("Emergency coordination maintenance failed")
+        finally:
+            db.close()
+
+
+def _route_origin(db: Session, emergency: EmergencyRequest) -> tuple[dict | None, str]:
+    location = _latest_ambulance_location(db, emergency)
+    if location:
+        return {"lat": location["latitude"], "lng": location["longitude"]}, "AMBULANCE_GPS"
+    return None, "GPS_UNAVAILABLE"
+
+
+def _route_summary(route: dict | None) -> dict:
+    if not route:
+        return {"available": False, "limitation": "A fresh ambulance GPS position or road route estimate is unavailable."}
+    return {
+        "available": True,
+        "distance_km": route.get("distance_km"),
+        "duration_min": route.get("duration_min"),
+        "provider": route.get("provider"),
+        "route_data_timestamp": route.get("available_at"),
+        "points": route.get("points") or [],
+        "traffic_available": False,
+    }
+
+
+def _clear_destination(db: Session, emergency: EmergencyRequest, reason: str) -> None:
+    previous = emergency.hospital_id
+    details = dict(emergency.details or {})
+    old_route = details.get("current_route", {})
+    details["assignment_version"] = int(details.get("assignment_version", 0)) + 1
+    details["current_route"] = _route_summary(None)
+    details["assigned_hospital_id"] = None
+    details["last_assignment_reason"] = reason
+    emergency.hospital_id = None
+    emergency.details = details
+    db.add(EmergencyRouteDecision(emergency_id=emergency.id, assignment_version=details["assignment_version"], previous_hospital_id=previous, selected_hospital_id=None, reason=reason, previous_route=old_route, selected_route={}, comparison=details.get("last_route_comparison", {})))
+    _escalate_emergency(db, emergency, reason)
+    _coordination_notice(db, emergency, "Provisional destination released", f"Emergency #{emergency.id}: release the previous provisional reservation. Dispatcher review required.")
+
+
+async def _reassess_assignment(db: Session, emergency: EmergencyRequest, actor_user_id: int | None, trigger: str) -> dict:
+    """Select a destination from accepted, clinically eligible candidates.
+
+    Compare-and-swap serializes the final database decision. All candidates are
+    compared from the same fresh ambulance location, and unavailable route
+    data is kept explicit instead of being replaced with a geometric ETA.
+    """
+    db.refresh(emergency)
+    if emergency.status in TERMINAL_EMERGENCY_STATUSES:
+        return {"changed": False, "reason": "Emergency has reached the hospital or closed"}
+    _expire_response_window(db, emergency)
+    db.commit()
+    db.refresh(emergency)
+    revision = emergency.state_version
+    details = dict(emergency.details or {})
+    required_service = details.get("required_service")
+    accepted_responses = db.scalars(
+        select(EmergencyHospitalResponse)
+        .where(EmergencyHospitalResponse.emergency_id == emergency.id, EmergencyHospitalResponse.status == "ACCEPTED")
+        .order_by(EmergencyHospitalResponse.responded_at.asc())
+    ).all()
+    hospitals = {hospital.id: hospital for hospital in db.scalars(select(Hospital).where(Hospital.id.in_([item.hospital_id for item in accepted_responses]))).all()} if accepted_responses else {}
+    route_origin, origin_kind = _route_origin(db, emergency)
+    candidates: list[dict] = []
+    for response in accepted_responses:
+        hospital = hospitals.get(response.hospital_id)
+        if not hospital:
+            continue
+        eligible, eligibility_reason = _hospital_eligibility(hospital, required_service)
+        if not eligible:
+            continue
+        if details.get("clinical_destination_locked") and hospital.id != details.get("clinical_hospital_id"):
+            continue
+        route = await bridge.calculate_route(route_origin, {"lat": hospital.latitude, "lng": hospital.longitude}) if route_origin else None
+        candidates.append({
+            "response": response,
+            "hospital": hospital,
+            "route": route,
+            "route_summary": _route_summary(route),
+            "eligibility_reason": eligibility_reason,
+        })
+
+    # Network work runs outside a write transaction. Re-read every mutable
+    # input before claiming the snapshot; newer GPS/status/acceptance wins.
+    db.expire_all()
+    db.refresh(emergency)
+    if emergency.state_version != revision or emergency.status in TERMINAL_EMERGENCY_STATUSES:
+        return {"changed": False, "stale": True, "reason": "Newer emergency state superseded route calculation"}
+    if route_origin and not _latest_ambulance_location(db, emergency):
+        return {"changed": False, "stale": True, "reason": "GPS expired during route calculation"}
+    for candidate in candidates:
+        db.refresh(candidate["hospital"])
+        route = candidate["route"]
+        if route and (datetime.now(timezone.utc) - _as_utc(datetime.fromisoformat(route["available_at"]))).total_seconds() > _configured_int("ROUTE_MAX_AGE_SECONDS", 30, 5, 300):
+            candidate["route"] = None
+            candidate["route_summary"] = _route_summary(None)
+    candidates = [item for item in candidates if _hospital_eligibility(item["hospital"], required_service)[0]]
+    _claim_emergency(db, emergency)
+
+    if not candidates:
+        details["last_route_comparison"] = {"available": False, "trigger": trigger, "origin_kind": origin_kind, "limitation": "No accepted hospital currently meets the declared care requirement and availability checks."}
+        emergency.details = details
+        if emergency.hospital_id or not details.get("notified_hospital_ids"):
+            _clear_destination(db, emergency, "Accepted destination unavailable or withdrawn; no eligible accepted replacement.")
+        db.commit()
+        return {"changed": False, "comparison": details["last_route_comparison"], "map_updated": None}
+
+    current_id = emergency.hospital_id
+    current = next((candidate for candidate in candidates if candidate["hospital"].id == current_id), None)
+    with_route = [candidate for candidate in candidates if candidate["route"]]
+    if current is None:
+        selected = min(with_route or candidates, key=lambda item: ((item["route"].get("duration_min", float("inf")) if item["route"] else float("inf")), (item["route"].get("distance_km", float("inf")) if item["route"] else float("inf")), _as_utc(item["response"].responded_at) or datetime.max.replace(tzinfo=timezone.utc)))
+        reason = "Confirmed eligible acceptance selected as the provisional destination."
+    else:
+        selected = current
+        reason = "Current destination retained."
+        alternatives = [candidate for candidate in candidates if candidate["hospital"].id != current_id]
+        last_change = details.get("last_assignment_at")
+        cooldown = _configured_int("REROUTE_COOLDOWN_SECONDS", 30, 0, 600)
+        too_soon = bool(last_change and int(details.get("assignment_version", 0)) > 1 and (datetime.now(timezone.utc) - _as_utc(datetime.fromisoformat(last_change))).total_seconds() < cooldown)
+        if too_soon or details.get("clinical_destination_locked"):
+            alternatives = []
+        if current["route"]:
+            current_minutes = float(current["route"].get("duration_min", 0))
+            for candidate in alternatives:
+                route = candidate["route"]
+                if not route or current_minutes <= _near_destination_minutes():
+                    continue
+                time_saving = current_minutes - float(route.get("duration_min", current_minutes))
+                distance_saving = float(current["route"].get("distance_km", 0)) - float(route.get("distance_km", 0))
+                switch_cost = _configured_float("REROUTE_SWITCH_COST_MINUTES", 1, 0, 30)
+                meaningful = time_saving - switch_cost >= _reroute_min_time_saving_minutes()
+                if _reroute_min_time_saving_minutes() == 0 and time_saving - switch_cost == 0:
+                    meaningful = distance_saving >= _reroute_min_distance_saving_km()
+                if meaningful and (not selected["route"] or (float(route["duration_min"]), float(route["distance_km"])) < (float(selected["route"]["duration_min"]), float(selected["route"]["distance_km"]))):
+                    selected = candidate
+                    reason = f"Rerouted because the alternative saves {round(time_saving, 2)} minutes and {round(distance_saving, 2)} km from the same current ambulance position."
+        else:
+            reason = "Current destination retained: comparable fresh road-route estimates are unavailable."
+    if emergency.hospital_id and current is None and (not route_origin or not selected["route"]):
+        _clear_destination(db, emergency, "Destination unavailable; fresh GPS and road routing are required for a replacement.")
+        db.commit()
+        return {"changed": True, "reason": "Dispatcher must confirm a replacement destination"}
+
+    selected_hospital = selected["hospital"]
+    previous_id = emergency.hospital_id
+    changed = previous_id != selected_hospital.id
+    comparison = {
+        "available": bool(route_origin and all(item["route"] for item in candidates)),
+        "origin": route_origin,
+        "origin_kind": origin_kind,
+        "trigger": trigger,
+        "candidates": [{"hospital_id": item["hospital"].id, "hospital_name": item["hospital"].name, "eligible": True, "eligibility_reason": item["eligibility_reason"], "route": item["route_summary"]} for item in candidates],
+        "current_hospital_id": previous_id,
+        "selected_hospital_id": selected_hospital.id,
+        "reason": reason,
+        "time_saving_minutes": round(float(current["route"]["duration_min"]) - float(selected["route"]["duration_min"]), 2) if current and current["route"] and selected["route"] else None,
+        "distance_saving_km": round(float(current["route"]["distance_km"]) - float(selected["route"]["distance_km"]), 2) if current and current["route"] and selected["route"] else None,
+    }
+    details["last_route_comparison"] = comparison
+    details["route_origin_kind"] = origin_kind
+    details["assigned_hospital_id"] = selected_hospital.id
+    details["assignment_version"] = int(details.get("assignment_version", 0)) + (1 if changed else 0)
+    details["current_route"] = selected["route_summary"]
+    emergency.details = details
+    if changed:
+        details["last_assignment_at"] = utc_iso()
+        details["last_assignment_reason"] = reason
+        details["assignment_status"] = "PROVISIONAL_DESTINATION"
+        details.pop("escalation", None)
+        emergency.details = dict(details)
+        emergency.hospital_id = selected_hospital.id
+        emergency.status = "ACCEPTED" if emergency.status in {"REQUESTED", "HOSPITAL_NOTIFIED", "NO_ACCEPTANCE"} else emergency.status
+        decision = EmergencyRouteDecision(
+            emergency_id=emergency.id,
+            assignment_version=details["assignment_version"],
+            previous_hospital_id=previous_id,
+            selected_hospital_id=selected_hospital.id,
+            reason=reason,
+            ambulance_latitude=route_origin["lat"] if route_origin else None,
+            ambulance_longitude=route_origin["lng"] if route_origin else None,
+            previous_route=current["route_summary"] if current else {},
+            selected_route=selected["route_summary"],
+            comparison=comparison,
+            route_data_timestamp=_as_utc(datetime.fromisoformat(selected["route"]["available_at"].replace("Z", "+00:00"))) if selected["route"] and selected["route"].get("available_at") else None,
+        )
+        db.add(decision)
+        comparison["map_update"] = "host_renderer_available; external_destination_interface_not_configured"
+        driver = db.scalar(select(AmbulanceDriver).where(AmbulanceDriver.ambulance_id == emergency.ambulance_id)) if emergency.ambulance_id else None
+        if driver:
+            driver_user = db.get(User, driver.user_id)
+            if driver_user:
+                await persist_notice(db, driver_user.id, "Emergency destination updated", f"Destination: {selected_hospital.name}. {reason}", "EMERGENCY", {"emergency_id": emergency.id, "assignment_version": details["assignment_version"], "hospital_id": selected_hospital.id, "route_comparison": comparison})
+        for hospital_user in db.scalars(select(User).where(User.hospital_id == selected_hospital.id, User.role == "HOSPITAL")).all():
+            await persist_notice(db, hospital_user.id, "Hospital selected for emergency", f"Emergency #{emergency.id} is assigned to {selected_hospital.name}.", "EMERGENCY", {"emergency_id": emergency.id, "assignment_version": details["assignment_version"], "hospital_id": selected_hospital.id})
+        if previous_id and previous_id != selected_hospital.id:
+            for hospital_user in db.scalars(select(User).where(User.hospital_id == previous_id, User.role == "HOSPITAL")).all():
+                await persist_notice(db, hospital_user.id, "Emergency assignment changed", f"Emergency #{emergency.id} is no longer assigned to your facility. Release any provisional reservation.", "EMERGENCY", {"emergency_id": emergency.id, "assignment_version": details["assignment_version"], "hospital_id": previous_id})
+    _coordination_notice(db, emergency, "Emergency route assessment", f"Emergency #{emergency.id}: {reason}")
+    outbound = {"emergency_id": emergency.id, "hospital_id": selected_hospital.map_place_id, "hospital_name": selected_hospital.name, "latitude": selected_hospital.latitude, "longitude": selected_hospital.longitude, "route": selected["route_summary"], "assignment_version": details["assignment_version"], "state_version": emergency.state_version}
+    db.commit()
+    await bridge.update_destination(f"MR-{outbound['emergency_id']}", outbound)
+    return {"changed": changed, "comparison": comparison, "map_updated": comparison.get("map_update") if changed else None}
+
+
+async def _record_hospital_response(db: Session, emergency: EmergencyRequest, user: User, payload: EmergencyHospitalResponseIn) -> dict:
+    if user.role != "HOSPITAL" or not user.hospital_id:
+        raise HTTPException(403, "Only an authenticated hospital account can respond")
+    _scope_emergency(db, emergency, user)
+    if emergency.status in TERMINAL_EMERGENCY_STATUSES:
+        raise HTTPException(409, "This emergency is no longer accepting hospital responses")
+    _expire_response_window(db, emergency)
+    db.commit()
+    _claim_emergency(db, emergency)
+    if emergency.status in TERMINAL_EMERGENCY_STATUSES:
+        raise HTTPException(409, "This emergency is no longer accepting hospital responses")
+    response = db.scalar(select(EmergencyHospitalResponse).where(EmergencyHospitalResponse.emergency_id == emergency.id, EmergencyHospitalResponse.hospital_id == user.hospital_id))
+    if not response:
+        raise HTTPException(403, "Your hospital was not notified for this emergency")
+    if response.status == payload.status:
+        db.rollback()
+        return {**_coordination_payload(db, emergency, user), "idempotent": True}
+    now = datetime.now(timezone.utc)
+    late = now > _as_utc(response.response_deadline)
+    if payload.status == "WITHDRAWN":
+        if response.status != "ACCEPTED":
+            raise HTTPException(409, "Only an accepted response can be withdrawn")
+    elif response.status not in {"PENDING", "TIMED_OUT"}:
+        raise HTTPException(409, "Response already recorded; an acceptance can only be withdrawn")
+    if late and payload.status != "WITHDRAWN":
+        late_enabled = os.getenv("EMERGENCY_ALLOW_LATE_ACCEPTANCE", "true").lower() == "true"
+        if payload.status != "ACCEPTED" or not late_enabled or emergency.status != "IN_TRANSIT" or not emergency.hospital_id:
+            raise HTTPException(409, "Response deadline passed; late acceptance is allowed only during an active hospital journey")
+        if not _latest_ambulance_location(db, emergency):
+            raise HTTPException(409, "Late acceptance needs a fresh ambulance GPS position")
+    if payload.status == "ACCEPTED":
+        hospital = db.get(Hospital, user.hospital_id)
+        eligible, reason = _hospital_eligibility(hospital, (emergency.details or {}).get("required_service"))
+        if not eligible:
+            raise HTTPException(409, reason)
+    response.status = payload.status
+    response.response_note = payload.note
+    response.responded_at = now
+    response.responded_by_user_id = user.id
+    response.eligibility = {**(response.eligibility or {}), "late_acceptance": late, "capacity_confirmed_at": now.isoformat() if payload.status == "ACCEPTED" else None}
+    if payload.status == "ACCEPTED" and not emergency.hospital_id:
+        details = dict(emergency.details or {})
+        if not details.get("clinical_destination_locked") or details.get("clinical_hospital_id") == user.hospital_id:
+            emergency.hospital_id = user.hospital_id
+            if emergency.status != "IN_TRANSIT":
+                emergency.status = "ACCEPTED"
+            details.update({"assigned_hospital_id":user.hospital_id, "assignment_version":int(details.get("assignment_version", 0))+1, "assignment_status":"PROVISIONAL_DESTINATION", "last_assignment_at":utc_iso(), "last_assignment_reason":"First eligible acceptance provisionally assigned immediately; road estimates are being requested.", "current_route":_route_summary(None)})
+            details.pop("escalation", None)
+            emergency.details = details
+            db.add(EmergencyRouteDecision(emergency_id=emergency.id, assignment_version=details["assignment_version"], previous_hospital_id=None, selected_hospital_id=user.hospital_id, reason="First eligible acceptance provisionally assigned immediately", selected_route=_route_summary(None), comparison={"trigger":"FIRST_ACCEPTANCE"}))
+            _coordination_notice(db, emergency, "Provisional destination assigned", f"Emergency #{emergency.id}: {hospital.name} accepted and is now the provisional destination.")
+    _coordination_notice(db, emergency, "Hospital response received", f"Emergency #{emergency.id}: a notified hospital {payload.status.lower()} the request.")
+    audit(db, user.id, "EMERGENCY_HOSPITAL_RESPONSE", "emergency_hospital_response", {"emergency_id": emergency.id, "hospital_id": user.hospital_id, "status": payload.status, "late": late})
+    db.flush()
+    all_responses = db.scalars(select(EmergencyHospitalResponse).where(EmergencyHospitalResponse.emergency_id == emergency.id)).all()
+    if all_responses and all(item.status in {"DECLINED", "TIMED_OUT", "WITHDRAWN"} for item in all_responses):
+        _escalate_emergency(db, emergency, "No notified hospital is currently accepting; contact dispatcher.")
+    db.commit()
+    result = await _reassess_assignment(db, emergency, user.id, "HOSPITAL_" + payload.status)
+    db.refresh(emergency)
+    return {**_coordination_payload(db, emergency, user), "decision": result}
 
 
 @app.get("/health", tags=["system"])
@@ -203,6 +930,25 @@ def me(user: User = Depends(get_current_user)) -> dict:
     return safe_user(user)
 
 
+@app.get("/api/coordination/config", tags=["emergency"])
+def coordination_config(user: User = Depends(get_current_user)):
+    return {"demo_enabled": os.getenv("MEDIROUTE_DEMO_COORDINATION", "false").lower() == "true", "response_window_seconds": 60, "gps_max_age_seconds": _gps_max_age_seconds(), "route_max_age_seconds": _configured_int("ROUTE_MAX_AGE_SECONDS", 30, 5, 300), "map_url": bridge.base_url}
+
+
+@app.get("/coordination-map/library.js", include_in_schema=False)
+async def coordination_map_library():
+    path = os.path.join(MAP_FRONTEND_DIR, "js", "map.js")
+    if os.path.isfile(path):
+        return FileResponse(path, media_type="application/javascript")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            result = await client.get(f"{bridge.base_url}/js/map.js")
+            result.raise_for_status()
+        return Response(result.text, media_type="application/javascript")
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, "Existing map renderer is unavailable") from exc
+
+
 @app.websocket("/api/ws/notifications/{user_id}")
 async def notifications_socket(websocket: WebSocket, user_id: int):
     token = websocket.query_params.get("token")
@@ -212,6 +958,15 @@ async def notifications_socket(websocket: WebSocket, user_id: int):
         await websocket.close(code=1008)
         return
     if token_user_id != user_id:
+        await websocket.close(code=1008)
+        return
+    db = next(get_db())
+    try:
+        account = db.get(User, user_id)
+        enabled = bool(account and account.active)
+    finally:
+        db.close()
+    if not enabled:
         await websocket.close(code=1008)
         return
     await manager.connect(user_id, websocket)
@@ -474,7 +1229,7 @@ FALLBACK_MAP_HOSPITALS = [
 @app.api_route("/api/ambulance/{path:path}", methods=["GET", "POST"])
 @app.api_route("/api/simulate/{path:path}", methods=["GET", "POST"])
 async def proxy_map_backend(request: Request, path: str = ""):
-    url = f"http://127.0.0.1:5000{request.url.path}"
+    url = f"{bridge.base_url}{request.url.path}"
     if request.url.query:
         url += f"?{request.url.query}"
     try:
@@ -489,22 +1244,10 @@ async def proxy_map_backend(request: Request, path: str = ""):
             content_type = res.headers.get("content-type", "")
             if "application/json" in content_type:
                 data = res.json()
-                if isinstance(data, dict) and "hospitals" in data and len(data.get("hospitals", [])) == 0:
-                    data["hospitals"] = FALLBACK_MAP_HOSPITALS
-                    data["count"] = len(FALLBACK_MAP_HOSPITALS)
                 return JSONResponse(status_code=res.status_code, content=data)
             return JSONResponse(status_code=res.status_code, content={"status": res.text})
-    except Exception:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "success": True,
-                "count": len(FALLBACK_MAP_HOSPITALS),
-                "hospitals": FALLBACK_MAP_HOSPITALS,
-                "origin": {"lat": 27.64687, "lng": 77.551921},
-                "status": "active_network"
-            }
-        )
+    except httpx.HTTPError:
+        return JSONResponse(status_code=503, content={"success": False, "detail": "Map service unavailable; no location, route or capacity estimate was fabricated."})
 
 
 @app.get("/api/hospitals", tags=["facilities"])
@@ -515,6 +1258,314 @@ def list_hospitals(db: Session = Depends(get_db)) -> list[dict]:
 @app.get("/api/hospitals/{hospital_id}", tags=["facilities"])
 def hospital_detail(hospital_id: int, db: Session = Depends(get_db)) -> dict:
     return as_dict(get_hospital(db, hospital_id))
+
+
+@app.post("/api/facility-discoveries/search", tags=["facility-discovery"])
+async def discover_facilities(
+    payload: FacilityDiscoveryIn,
+    request: Request,
+    user: User = Depends(require_roles("ADMIN", "GOVERNMENT_AUTHORITY")),
+    db: Session = Depends(get_db),
+) -> dict:
+    rate_limit(request, limit=10, window_seconds=300)
+    location = payload.location.strip()
+    facility_type = payload.facility_type.strip() if payload.facility_type else None
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=_cooldown_seconds())
+    if not payload.force_refresh:
+        cached = db.scalars(
+            select(FacilityDiscovery)
+            .where(FacilityDiscovery.search_location == location, FacilityDiscovery.requested_facility_type == facility_type, FacilityDiscovery.discovered_at >= cutoff)
+            .order_by(FacilityDiscovery.discovered_at.desc())
+        ).all()
+        if cached:
+            return {"items": [_facility_payload(item) for item in cached], "count": len(cached), "cached": True, "source": "stored_tinyfish_results"}
+    try:
+        candidates = await tinyfish_client.discover_facilities(location, facility_type)
+    except TinyFishError as exc:
+        raise _tinyfish_http_exception(exc) from exc
+    items: list[FacilityDiscovery] = []
+    for candidate in candidates:
+        duplicate_kind, duplicate_match_id, duplicate_score = _facility_duplicate(db, candidate)
+        existing = db.scalar(
+            select(FacilityDiscovery)
+            .where(FacilityDiscovery.source_url == candidate["source_url"], FacilityDiscovery.name == candidate["name"])
+            .order_by(FacilityDiscovery.discovered_at.desc())
+        )
+        if existing and existing.verification_status not in {"REJECTED", "DUPLICATE"}:
+            if existing.verification_status == "PENDING_VERIFICATION":
+                for field, value in candidate.items():
+                    if hasattr(existing, field):
+                        setattr(existing, field, value)
+            existing.last_checked_at = datetime.now(timezone.utc)
+            existing.duplicate_kind, existing.duplicate_match_id, existing.duplicate_score = duplicate_kind, duplicate_match_id, duplicate_score
+            items.append(existing)
+            continue
+        record = FacilityDiscovery(**candidate, duplicate_kind=duplicate_kind, duplicate_match_id=duplicate_match_id, duplicate_score=duplicate_score)
+        db.add(record)
+        db.flush()
+        items.append(record)
+    audit(db, user.id, "TINYFISH_FACILITY_DISCOVERY", "facility_discovery", {"location": location, "facility_type": facility_type, "count": len(items)})
+    db.commit()
+    return {"items": [_facility_payload(item) for item in items], "count": len(items), "cached": False, "source": "tinyfish_search_and_fetch", "message": "No results were fabricated; missing published fields remain unavailable."}
+
+
+@app.get("/api/facility-discoveries", tags=["facility-discovery"])
+def list_facility_discoveries(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status_filter: str | None = Query(None, alias="status"),
+    location: str | None = Query(None, max_length=255),
+    user: User = Depends(require_roles("ADMIN", "GOVERNMENT_AUTHORITY")),
+    db: Session = Depends(get_db),
+) -> dict:
+    allowed = {"PENDING_VERIFICATION", "VERIFIED", "REJECTED", "DUPLICATE"}
+    if status_filter and status_filter not in allowed:
+        raise HTTPException(422, "Unsupported facility discovery status")
+    stmt = select(FacilityDiscovery)
+    if status_filter:
+        stmt = stmt.where(FacilityDiscovery.verification_status == status_filter)
+    if location:
+        stmt = stmt.where(FacilityDiscovery.search_location.ilike(f"%{location.strip()}%"))
+    stmt = stmt.order_by(FacilityDiscovery.discovered_at.desc())
+    records = db.scalars(stmt).all()
+    start = (page - 1) * page_size
+    return {"items": [_facility_payload(item) for item in records[start:start + page_size]], "total": len(records), "page": page, "page_size": page_size}
+
+
+@app.get("/api/facility-discoveries/{discovery_id}", tags=["facility-discovery"])
+def facility_discovery_detail(discovery_id: int, user: User = Depends(require_roles("ADMIN", "GOVERNMENT_AUTHORITY")), db: Session = Depends(get_db)) -> dict:
+    record = db.get(FacilityDiscovery, discovery_id)
+    if not record:
+        raise HTTPException(404, "Facility discovery not found")
+    return _facility_payload(record)
+
+
+@app.patch("/api/facility-discoveries/{discovery_id}/review", tags=["facility-discovery"])
+def review_facility_discovery(
+    discovery_id: int,
+    payload: DiscoveryReviewIn,
+    user: User = Depends(require_roles("ADMIN", "GOVERNMENT_AUTHORITY")),
+    db: Session = Depends(get_db),
+) -> dict:
+    record = db.get(FacilityDiscovery, discovery_id)
+    if not record:
+        raise HTTPException(404, "Facility discovery not found")
+    if record.verification_status in {"VERIFIED", "REJECTED", "DUPLICATE"} and payload.status != record.verification_status:
+        raise HTTPException(409, "This discovery has already been reviewed")
+    reviewed_at = datetime.now(timezone.utc)
+    if payload.status == "VERIFIED":
+        if record.duplicate_match_id and record.duplicate_kind == "ALREADY_EXISTS":
+            record.verification_status = "DUPLICATE"
+            record.review_note = payload.note or "Matched an existing trusted hospital record."
+        elif not record.address:
+            raise HTTPException(422, "An address published by a source is required before adding a facility to the trusted directory")
+        else:
+            hospital = Hospital(
+                name=record.name,
+                address=record.address,
+                phone=record.phone,
+                latitude=record.latitude,
+                longitude=record.longitude,
+                services=record.services or [],
+                location_source="REVIEWED_SOURCE" if _valid_coordinates(record.latitude, record.longitude) else None,
+                capabilities_source="REVIEWED_SOURCE",
+                emergency_capacity=0,
+                emergency_available=0,
+                beds_available=0,
+                doctors_available=0,
+                active=True,
+            )
+            db.add(hospital)
+            db.flush()
+            record.approved_hospital_id = hospital.id
+            record.verification_status = "VERIFIED"
+            record.review_note = payload.note
+    else:
+        record.verification_status = payload.status
+        record.review_note = payload.note
+    record.reviewed_by_user_id = user.id
+    record.reviewed_at = reviewed_at
+    audit(db, user.id, "REVIEW_FACILITY_DISCOVERY", "facility_discovery", {"discovery_id": discovery_id, "status": record.verification_status})
+    db.commit()
+    db.refresh(record)
+    return _facility_payload(record)
+
+
+@app.get("/api/healthcare-schemes", tags=["healthcare-schemes"])
+def list_healthcare_schemes(
+    keyword: str | None = Query(None, max_length=200),
+    state: str | None = Query(None, max_length=120),
+    category: str | None = Query(None, max_length=120),
+    beneficiary: str | None = Query(None, max_length=120),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    include_unverified: bool = False,
+    status_filter: str | None = Query(None, alias="status"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    privileged = user.role in {"ADMIN", "GOVERNMENT_AUTHORITY"}
+    if (include_unverified or status_filter) and not privileged:
+        raise HTTPException(403, "Only authorized reviewers can inspect unverified schemes")
+    allowed_statuses = {"PENDING_REVIEW", "APPROVED", "REJECTED", "DUPLICATE", "REVIEW_REQUIRED"}
+    if status_filter and status_filter not in allowed_statuses:
+        raise HTTPException(422, "Unsupported healthcare scheme status")
+    stmt = select(HealthcareScheme).order_by(HealthcareScheme.last_checked_at.desc())
+    if include_unverified or status_filter:
+        if status_filter:
+            stmt = stmt.where(HealthcareScheme.verification_status == status_filter)
+    else:
+        stmt = stmt.where(HealthcareScheme.verification_status == "APPROVED", HealthcareScheme.active_status == "ACTIVE")
+    records = db.scalars(stmt).all()
+    if not (include_unverified or status_filter):
+        records = [item for item in records if not scheme_quality_issue(item)]
+    keyword_term = (keyword or "").strip().casefold()
+    state_term = (state or "").strip().casefold()
+    category_term = (category or "").strip().casefold()
+    beneficiary_term = (beneficiary or "").strip().casefold()
+    if keyword_term:
+        records = [item for item in records if keyword_term in _scheme_search_blob(item)]
+    if state_term:
+        records = [item for item in records if state_term in (item.geographic_coverage or "").casefold()]
+    if category_term:
+        records = [item for item in records if category_term in _scheme_search_blob(item)]
+    if beneficiary_term:
+        beneficiary_blob = lambda item: " ".join((item.beneficiary_categories or []) + (item.eligibility or []) + [item.description or ""]).casefold()
+        records = [item for item in records if beneficiary_term in beneficiary_blob(item)]
+    start = (page - 1) * page_size
+    page_items = records[start:start + page_size]
+    message = (
+        "No matching approved and active scheme records were found. An authorized government reviewer can use the Healthcare Schemes discovery queue to refresh and review official sources."
+        if not page_items
+        else "Results are limited to approved and active scheme records. Confirm current eligibility with the official source."
+    )
+    return {
+        "items": [_scheme_payload(item) for item in page_items],
+        "total": len(records),
+        "page": page,
+        "page_size": page_size,
+        "source": "approved_active_database",
+        "message": message,
+        "filters": {"keyword": keyword, "state": state, "category": category, "beneficiary": beneficiary},
+        "stats": _scheme_stats(db, privileged),
+    }
+
+
+@app.post("/api/healthcare-schemes/discover", tags=["healthcare-schemes"])
+@app.post("/api/healthcare-schemes/refresh", tags=["healthcare-schemes"])
+async def discover_healthcare_schemes(
+    payload: SchemeDiscoveryIn,
+    request: Request,
+    user: User = Depends(require_roles("ADMIN", "GOVERNMENT_AUTHORITY")),
+    db: Session = Depends(get_db),
+) -> dict:
+    rate_limit(request, limit=10, window_seconds=300)
+    query = _scheme_query(payload)
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=_cooldown_seconds())
+    if not payload.force_refresh:
+        cached = db.scalars(select(HealthcareScheme).where(HealthcareScheme.search_query == query, HealthcareScheme.last_checked_at >= cutoff).order_by(HealthcareScheme.last_checked_at.desc())).all()
+        if cached:
+            return {"items": [_scheme_payload(item) for item in cached], "count": len(cached), "cached": True, "source": "stored_tinyfish_results"}
+    try:
+        candidates = await tinyfish_client.discover_schemes(payload.keyword, payload.state, payload.category, payload.beneficiary)
+    except TinyFishError as exc:
+        raise _tinyfish_http_exception(exc) from exc
+    items: list[HealthcareScheme] = []
+    for candidate in candidates:
+        candidate = sanitize_scheme_candidate(candidate)
+        issue = scheme_quality_issue(candidate)
+        if issue:
+            candidate = {**candidate, "verification_status": "REVIEW_REQUIRED", "active_status": "REVIEW_REQUIRED"}
+        existing = db.scalar(select(HealthcareScheme).where(HealthcareScheme.normalized_name == candidate["normalized_name"]).order_by(HealthcareScheme.created_at.asc()))
+        if existing:
+            if existing.verification_status != "APPROVED":
+                for field, value in candidate.items():
+                    if hasattr(existing, field):
+                        setattr(existing, field, value)
+            existing.source_urls = _merge_unique(existing.source_urls, candidate.get("source_urls"))
+            existing.source_evidence = _merge_unique(existing.source_evidence, candidate.get("source_evidence"))
+            existing.last_checked_at = datetime.now(timezone.utc)
+            items.append(existing)
+            continue
+        record = HealthcareScheme(**candidate)
+        db.add(record)
+        db.flush()
+        items.append(record)
+    audit(db, user.id, "TINYFISH_SCHEME_DISCOVERY", "healthcare_scheme", {"query": query, "count": len(items), "source": "tinyfish_search_and_fetch"})
+    db.commit()
+    return {"items": [_scheme_payload(item) for item in items], "count": len(items), "cached": False, "source": "tinyfish_search_and_fetch", "message": "Only official-source results are stored; missing published fields remain unavailable until review."}
+
+
+@app.get("/api/healthcare-schemes/discoveries", tags=["healthcare-schemes"])
+def list_scheme_discoveries(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    status_filter: str | None = Query(None, alias="status"),
+    user: User = Depends(require_roles("ADMIN", "GOVERNMENT_AUTHORITY")),
+    db: Session = Depends(get_db),
+) -> dict:
+    allowed = {"PENDING_REVIEW", "APPROVED", "REJECTED", "DUPLICATE", "REVIEW_REQUIRED"}
+    if status_filter and status_filter not in allowed:
+        raise HTTPException(422, "Unsupported healthcare scheme status")
+    stmt = select(HealthcareScheme)
+    if status_filter:
+        stmt = stmt.where(HealthcareScheme.verification_status == status_filter)
+    records = db.scalars(stmt.order_by(HealthcareScheme.last_checked_at.desc())).all()
+    start = (page - 1) * page_size
+    return {"items": [_scheme_payload(item) for item in records[start:start + page_size]], "total": len(records), "page": page, "page_size": page_size}
+
+
+@app.get("/api/healthcare-schemes/summary", tags=["healthcare-schemes"])
+def healthcare_scheme_summary(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    return _scheme_stats(db, user.role in {"ADMIN", "GOVERNMENT_AUTHORITY"})
+
+
+@app.get("/api/healthcare-schemes/{scheme_id}", tags=["healthcare-schemes"])
+def healthcare_scheme_detail(
+    scheme_id: int,
+    include_unverified: bool = False,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    record = db.get(HealthcareScheme, scheme_id)
+    if not record:
+        raise HTTPException(404, "Healthcare scheme not found")
+    if (record.verification_status != "APPROVED" or record.active_status != "ACTIVE" or scheme_quality_issue(record)) and not (include_unverified and user.role in {"ADMIN", "GOVERNMENT_AUTHORITY"}):
+        raise HTTPException(404, "Healthcare scheme not found")
+    return _scheme_payload(record)
+
+
+@app.patch("/api/healthcare-schemes/{scheme_id}/review", tags=["healthcare-schemes"])
+def review_healthcare_scheme(
+    scheme_id: int,
+    payload: SchemeReviewIn,
+    user: User = Depends(require_roles("ADMIN", "GOVERNMENT_AUTHORITY")),
+    db: Session = Depends(get_db),
+) -> dict:
+    record = db.get(HealthcareScheme, scheme_id)
+    if not record:
+        raise HTTPException(404, "Healthcare scheme not found")
+    if payload.status == "APPROVED":
+        issue = scheme_quality_issue(record)
+        if issue:
+            raise HTTPException(422, issue)
+        if not record.official_information_url or not is_official_source(record.official_information_url):
+            raise HTTPException(422, "An official government information source is required before approval")
+        record.verification_status = "APPROVED"
+        record.active_status = payload.active_status or "ACTIVE"
+    elif payload.status == "REJECTED":
+        record.verification_status, record.active_status = "REJECTED", "INACTIVE"
+    elif payload.status == "DUPLICATE":
+        record.verification_status, record.active_status = "DUPLICATE", "INACTIVE"
+    else:
+        record.verification_status, record.active_status = "REVIEW_REQUIRED", "REVIEW_REQUIRED"
+    record.reviewed_by_user_id = user.id
+    record.reviewed_at = datetime.now(timezone.utc)
+    record.review_note = payload.note
+    audit(db, user.id, "REVIEW_HEALTHCARE_SCHEME", "healthcare_scheme", {"scheme_id": scheme_id, "status": record.verification_status})
+    db.commit()
+    db.refresh(record)
+    return _scheme_payload(record)
 
 
 @app.get("/api/hospitals/me/patients", tags=["facilities"])
@@ -544,7 +1595,12 @@ def hospital_referrals(user: User = Depends(require_roles("HOSPITAL")), db: Sess
 
 @app.get("/api/hospitals/me/emergencies", tags=["facilities"])
 def hospital_emergencies(user: User = Depends(require_roles("HOSPITAL")), db: Session = Depends(get_db)) -> list[dict]:
-    return [as_dict(item) for item in db.scalars(select(EmergencyRequest).where(EmergencyRequest.hospital_id == user.hospital_id).order_by(EmergencyRequest.created_at.desc())).all()]
+    ids = db.scalars(select(EmergencyHospitalResponse.emergency_id).where(EmergencyHospitalResponse.hospital_id == user.hospital_id)).all()
+    emergencies = db.scalars(select(EmergencyRequest).where((EmergencyRequest.id.in_(ids)) | (EmergencyRequest.hospital_id == user.hospital_id)).order_by(EmergencyRequest.created_at.desc())).all()
+    for emergency in emergencies:
+        _expire_response_window(db, emergency)
+    db.commit()
+    return [_coordination_payload(db, item, user) for item in emergencies]
 
 
 @app.get("/api/hospitals/me/diagnostics", tags=["facilities"])
@@ -566,7 +1622,13 @@ async def update_capacity(hospital_id: int, payload: dict[str, int], user: User 
         if name in allowed and isinstance(value, int) and value >= 0:
             setattr(hospital, name, value)
     audit(db, user.id, "UPDATE_CAPACITY", "hospital", {"hospital_id": hospital_id})
+    hospital.availability_checked_at = datetime.now(timezone.utc)
+    affected = db.scalars(select(EmergencyRequest).where(EmergencyRequest.id.in_(select(EmergencyHospitalResponse.emergency_id).where(EmergencyHospitalResponse.hospital_id == hospital_id, EmergencyHospitalResponse.status == "ACCEPTED")), EmergencyRequest.status.notin_(TERMINAL_EMERGENCY_STATUSES))).all()
+    for emergency in affected:
+        _claim_emergency(db, emergency)
     db.commit(); db.refresh(hospital)
+    for emergency in affected:
+        await _reassess_assignment(db, emergency, user.id, "HOSPITAL_AVAILABILITY_CHANGED")
     return as_dict(hospital)
 
 
@@ -901,33 +1963,80 @@ def my_referrals(user: User = Depends(require_roles("PATIENT")), db: Session = D
 
 @app.post("/api/emergencies", tags=["emergency"], status_code=201)
 async def create_emergency(payload: EmergencyIn, user: User = Depends(require_roles("PATIENT", "HOSPITAL", "AMBULANCE_DRIVER")), db: Session = Depends(get_db)) -> dict:
+    if payload.demo and os.getenv("MEDIROUTE_DEMO_COORDINATION", "false").lower() != "true":
+        raise HTTPException(422, "Demo coordination is not enabled on this backend")
+    if payload.clinical_destination_locked and (user.role != "HOSPITAL" or not payload.hospital_id):
+        raise HTTPException(403, "A clinical destination lock requires a hospital clinician and destination")
+    if payload.origin == "AMBULANCE":
+        raise HTTPException(422, "Create the pickup emergency first, broadcast current GPS, then dispatch with origin AMBULANCE")
     patient_id = payload.patient_id
     if user.role == "PATIENT": patient_id = patient_for_user(db, user).id
-    matches = match_facilities(db, payload.latitude, payload.longitude, payload.required_service)
-    hospital_id = payload.hospital_id or (matches[0]["hospital_id"] if matches else None)
-    hospital = get_hospital(db, hospital_id) if hospital_id else None
+    matches, used_radius = _nearby_coordination_hospitals(db, payload.latitude, payload.longitude, payload.required_service, demo=payload.demo)
+    if payload.clinical_destination_locked:
+        matches = [item for item in matches if item["hospital_id"] == payload.hospital_id]
     ambulance_id = payload.ambulance_id
     if user.role == "AMBULANCE_DRIVER":
         driver = db.scalar(select(AmbulanceDriver).where(AmbulanceDriver.user_id == user.id))
-        ambulance_id = driver.ambulance_id if driver else ambulance_id
+        if not driver or not driver.ambulance_id:
+            raise HTTPException(409, "Your driver account is not linked to an ambulance")
+        ambulance_id = driver.ambulance_id
     if not ambulance_id:
         avail_amb = db.scalar(select(Ambulance).where(Ambulance.status == "AVAILABLE").limit(1))
         if avail_amb:
             ambulance_id = avail_amb.id
-    emergency = EmergencyRequest(patient_id=patient_id, hospital_id=hospital_id, ambulance_id=ambulance_id, status="REQUESTED", details={"condition": payload.condition, "latitude": payload.latitude, "longitude": payload.longitude, "matches": matches, "timeline": [{"status": "REQUESTED", "at": utc_iso()}]})
+    dispatch_at = datetime.now(timezone.utc)
+    deadline = dispatch_at + timedelta(seconds=_response_window_seconds())
+    status_value = "HOSPITAL_NOTIFIED" if matches else "NO_ELIGIBLE_HOSPITAL"
+    emergency = EmergencyRequest(
+        patient_id=patient_id,
+        hospital_id=None,
+        ambulance_id=ambulance_id,
+        status=status_value,
+        details={
+            "condition": payload.condition,
+            "required_service": payload.required_service,
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+            "origin_source": "PICKUP_LOCATION",
+            "demo": payload.demo,
+            "clinical_destination_locked": payload.clinical_destination_locked,
+            "clinical_hospital_id": payload.hospital_id if payload.clinical_destination_locked else None,
+            "matches": matches,
+            "search_radius_km": used_radius,
+            "dispatch_at": dispatch_at.isoformat(),
+            "response_deadline": deadline.isoformat(),
+            "assignment_version": 0,
+            "notified_hospital_ids": [item["hospital_id"] for item in matches],
+            "timeline": [{"status": status_value, "at": dispatch_at.isoformat(), "response_deadline": deadline.isoformat()}],
+        },
+    )
     db.add(emergency); db.flush()
-    ambulance = db.get(Ambulance, ambulance_id) if ambulance_id else None
-    map_result = await bridge.dispatch({"ambulance_id": ambulance.map_ambulance_id if ambulance else "AMB-101", "map_place_id": hospital.map_place_id if hospital else "JS001", "patient_name": payload.patient_name or "Emergency Patient", "condition": payload.condition, "latitude": payload.latitude, "longitude": payload.longitude})
-    if map_result["connected"]:
-        emergency.map_request_id = map_result["data"].get("request_id")
-    if hospital:
-        for hospital_user in db.scalars(select(User).where(User.hospital_id == hospital.id, User.role == "HOSPITAL")).all():
-            await persist_notice(db, hospital_user.id, "Emergency request", f"Emergency request #{emergency.id} requires {payload.condition}.", "EMERGENCY", {"emergency_id": emergency.id})
+    # Legacy map dispatch auto-selects JS001 and broadcasts unauthenticated
+    # acceptances. Coordinated requests instead use the host map renderer and
+    # optional versioned destination adapter, with this DB as authority.
+    map_result = {"connected": False}
+    for match in matches:
+        response = EmergencyHospitalResponse(
+            emergency_id=emergency.id,
+            hospital_id=match["hospital_id"],
+            status="PENDING",
+            notified_at=dispatch_at,
+            response_deadline=deadline,
+            distance_km=match["distance_km"],
+            eligibility={"required_service": payload.required_service, "reason": match["eligibility_reason"], "capabilities_source": match["capabilities_source"], "demo_facility": match["demo_facility"]},
+        )
+        db.add(response)
+        db.flush()
+        for hospital_user in db.scalars(select(User).where(User.hospital_id == match["hospital_id"], User.role == "HOSPITAL")).all():
+            await persist_notice(db, hospital_user.id, "Incoming emergency request", f"Emergency #{emergency.id}: {payload.condition}. Response required within {_response_window_seconds()} seconds.", "EMERGENCY", {"emergency_id": emergency.id, "response_id": response.id, "hospital_id": match["hospital_id"], "distance_km": match["distance_km"], "response_deadline": deadline.isoformat(), "required_service": payload.required_service})
     if patient_id:
         patient = db.get(PatientProfile, patient_id)
         if patient: await persist_notice(db, patient.user_id, "Emergency request sent", "Facilities are being notified. Keep the app open for updates.", "EMERGENCY", {"emergency_id": emergency.id})
+    _coordination_notice(db, emergency, "Emergency coordination started", f"Emergency #{emergency.id}: {len(matches)} eligible hospitals notified.")
+    if not matches:
+        _escalate_emergency(db, emergency, "No eligible configured hospital found within the maximum radius.")
     audit(db, user.id, "CREATE_EMERGENCY", "emergency", {"emergency_id": emergency.id, "map_connected": map_result["connected"]}); db.commit(); db.refresh(emergency)
-    return {**as_dict(emergency), "map_integration": {"connected": map_result["connected"], "message": "Dispatched to protected map service" if map_result["connected"] else "Map service unavailable; emergency has been safely stored for follow-up."}}
+    return {**_coordination_payload(db, emergency), "map_integration": {"connected": False, "message": "Hospital coordination dispatched. The existing map renderer will display the accepted route; external destination sync requires the versioned map adapter."}}
 
 
 @app.patch("/api/emergencies/{emergency_id}/status", tags=["emergency"])
@@ -935,20 +2044,143 @@ async def update_emergency_status(emergency_id: int, payload: dict[str, str], us
     emergency = db.get(EmergencyRequest, emergency_id)
     if not emergency: raise HTTPException(404, "Emergency request not found")
     requested = str(payload.get("status", "")).upper()
+    _scope_emergency(db, emergency, user)
+    if requested in {"ACCEPTED", "REJECTED"} and user.role == "HOSPITAL":
+        if db.scalar(select(EmergencyHospitalResponse.id).where(EmergencyHospitalResponse.emergency_id == emergency.id)):
+            return await _record_hospital_response(db, emergency, user, EmergencyHospitalResponseIn(status="ACCEPTED" if requested == "ACCEPTED" else "DECLINED", note=payload.get("reason")))
     allowed = {"HOSPITAL_NOTIFIED", "ACCEPTED", "REJECTED", "DRIVER_ASSIGNED", "IN_TRANSIT", "ARRIVED", "UNDER_TREATMENT", "COMPLETED", "CANCELLED"}
     if requested not in allowed: raise HTTPException(422, "Unsupported emergency status")
-    if user.role == "HOSPITAL": ensure_hospital_scope(user, emergency.hospital_id or -1)
+    transitions = {"REQUESTED": {"HOSPITAL_NOTIFIED", "DRIVER_ASSIGNED", "CANCELLED"}, "HOSPITAL_NOTIFIED": {"DRIVER_ASSIGNED", "CANCELLED"}, "NO_ELIGIBLE_HOSPITAL": {"DRIVER_ASSIGNED", "CANCELLED"}, "NO_ACCEPTANCE": {"CANCELLED"}, "ACCEPTED": {"DRIVER_ASSIGNED", "IN_TRANSIT", "CANCELLED"}, "DRIVER_ASSIGNED": {"IN_TRANSIT", "CANCELLED"}, "IN_TRANSIT": {"ARRIVED", "CANCELLED"}, "ARRIVED": {"UNDER_TREATMENT", "COMPLETED"}, "UNDER_TREATMENT": {"COMPLETED"}}
+    legacy_acceptance = requested in {"ACCEPTED", "REJECTED"} and user.role == "HOSPITAL" and emergency.hospital_id == user.hospital_id and emergency.status == "REQUESTED"
+    if requested != emergency.status and requested not in transitions.get(emergency.status, set()) and not legacy_acceptance:
+        raise HTTPException(409, "Invalid emergency lifecycle transition")
+    if requested == "IN_TRANSIT" and not emergency.hospital_id:
+        raise HTTPException(409, "A confirmed hospital destination is required for hospital transit")
+    _claim_emergency(db, emergency)
+    if user.role == "HOSPITAL":
+        ensure_hospital_scope(user, emergency.hospital_id or -1)
     if user.role == "AMBULANCE_DRIVER" and not emergency.ambulance_id:
         driver = db.scalar(select(AmbulanceDriver).where(AmbulanceDriver.user_id == user.id))
         if driver and driver.ambulance_id:
             emergency.ambulance_id = driver.ambulance_id
-    emergency.status = requested; details = emergency.details or {}; details["timeline"] = [*(details.get("timeline", [])), {"status": requested, "at": utc_iso()}]; emergency.details = details
-    map_response_relayed = await bridge.respond(emergency.map_request_id, requested, payload.get("reason")) if emergency.map_request_id and requested in {"ACCEPTED", "REJECTED"} else None
+    if requested in {"ARRIVED", "UNDER_TREATMENT", "COMPLETED", "CANCELLED"}:
+        details = dict(emergency.details or {})
+        details["timeline"] = [*(details.get("timeline", [])), {"status": requested, "at": utc_iso()}]
+        details["rerouting_operational"] = requested not in {"ARRIVED", "UNDER_TREATMENT", "COMPLETED", "CANCELLED"}
+        emergency.details = details
+    else:
+        details = dict(emergency.details or {})
+        details["timeline"] = [*(details.get("timeline", [])), {"status": requested, "at": utc_iso()}]
+        emergency.details = details
+    emergency.status = requested
+    map_response_relayed = None
+    _coordination_notice(db, emergency, "Emergency status changed", f"Emergency #{emergency.id}: {requested}.")
     if emergency.patient_id:
         patient = db.get(PatientProfile, emergency.patient_id)
         if patient: await persist_notice(db, patient.user_id, "Emergency update", f"Emergency status: {requested.replace('_', ' ').title()}.", "EMERGENCY", {"emergency_id": emergency.id})
     audit(db, user.id, "UPDATE_EMERGENCY", "emergency", {"emergency_id": emergency.id, "status": requested}); db.commit(); db.refresh(emergency)
-    return {**as_dict(emergency), "map_response_relayed": map_response_relayed}
+    return {**_coordination_payload(db, emergency), "map_response_relayed": map_response_relayed}
+
+
+@app.get("/api/emergencies/{emergency_id}/coordination", tags=["emergency"])
+def emergency_coordination(emergency_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    emergency = db.get(EmergencyRequest, emergency_id)
+    if not emergency:
+        raise HTTPException(404, "Emergency request not found")
+    _scope_emergency(db, emergency, user)
+    _expire_response_window(db, emergency)
+    db.commit()
+    return _coordination_payload(db, emergency, user)
+
+
+@app.post("/api/emergencies/{emergency_id}/dispatch", tags=["emergency"])
+async def dispatch_emergency_coordination(emergency_id: int, payload: EmergencyDispatchIn | None = None, user: User = Depends(require_roles("AMBULANCE_DRIVER", "ADMIN")), db: Session = Depends(get_db)) -> dict:
+    emergency = db.get(EmergencyRequest, emergency_id)
+    if not emergency:
+        raise HTTPException(404, "Emergency request not found")
+    if emergency.status in TERMINAL_EMERGENCY_STATUSES:
+        raise HTTPException(409, "Emergency has arrived or closed")
+    if user.role == "AMBULANCE_DRIVER":
+        driver = db.scalar(select(AmbulanceDriver).where(AmbulanceDriver.user_id == user.id))
+        if not driver or driver.ambulance_id != emergency.ambulance_id:
+            raise HTTPException(403, "You are not assigned to this emergency")
+    location = _latest_ambulance_location(db, emergency)
+    if payload and payload.origin == "AMBULANCE":
+        if not location:
+            raise HTTPException(422, "Fresh ambulance GPS is required; enable location permission and broadcast GPS")
+        origin = (location["latitude"], location["longitude"])
+    else:
+        origin = _emergency_origin(emergency)
+    if not origin:
+        raise HTTPException(422, "Emergency pickup coordinates are unavailable")
+    required_service = (emergency.details or {}).get("required_service")
+    if payload and payload.required_service and payload.required_service != required_service:
+        raise HTTPException(409, "Dispatch cannot override the recorded clinical care requirement")
+    matches, used_radius = _nearby_coordination_hospitals(db, origin[0], origin[1], required_service, payload.radius_km if payload else None, demo=bool((emergency.details or {}).get("demo")))
+    if (emergency.details or {}).get("clinical_destination_locked"):
+        matches = [item for item in matches if item["hospital_id"] == emergency.details.get("clinical_hospital_id")]
+    if not matches:
+        raise HTTPException(409, "No eligible hospital with a valid configured location was found within the maximum search radius")
+    existing = {item.hospital_id: item for item in db.scalars(select(EmergencyHospitalResponse).where(EmergencyHospitalResponse.emergency_id == emergency.id)).all()}
+    if existing:
+        return {**_coordination_payload(db, emergency, user), "nearby_from_requested_origin": matches, "search_origin": {"latitude": origin[0], "longitude": origin[1]}, "idempotent": True}
+    _claim_emergency(db, emergency)
+    dispatch_at = datetime.now(timezone.utc)
+    deadline = dispatch_at + timedelta(seconds=_response_window_seconds())
+    details = dict(emergency.details or {})
+    details.update({"search_radius_km": used_radius, "notified_hospital_ids": [item["hospital_id"] for item in matches], "dispatch_at": dispatch_at.isoformat(), "response_deadline": deadline.isoformat(), "dispatch_origin": {"latitude": origin[0], "longitude": origin[1], "source": payload.origin if payload else "PICKUP"}})
+    emergency.details = details
+    for match in matches:
+        response = existing.get(match["hospital_id"])
+        if response:
+            response.distance_km = match["distance_km"]
+            continue
+        response = EmergencyHospitalResponse(emergency_id=emergency.id, hospital_id=match["hospital_id"], status="PENDING", notified_at=dispatch_at, response_deadline=deadline, distance_km=match["distance_km"], eligibility={"required_service": required_service, "reason": match["eligibility_reason"], "demo_facility": match["demo_facility"]})
+        db.add(response); db.flush()
+        for hospital_user in db.scalars(select(User).where(User.hospital_id == match["hospital_id"], User.role == "HOSPITAL")).all():
+            await persist_notice(db, hospital_user.id, "Incoming emergency request", f"Emergency #{emergency.id}: response required within {_response_window_seconds()} seconds.", "EMERGENCY", {"emergency_id": emergency.id, "response_id": response.id, "hospital_id": match["hospital_id"], "distance_km": match["distance_km"], "response_deadline": deadline.isoformat()})
+    emergency.status = "HOSPITAL_NOTIFIED"
+    audit(db, user.id, "DISPATCH_EMERGENCY_COORDINATION", "emergency", {"emergency_id": emergency.id, "hospital_count": len(matches), "radius_km": used_radius})
+    db.commit(); db.refresh(emergency)
+    return _coordination_payload(db, emergency)
+
+
+@app.patch("/api/emergencies/{emergency_id}/hospital-response", tags=["emergency"])
+async def emergency_hospital_response(emergency_id: int, payload: EmergencyHospitalResponseIn, user: User = Depends(require_roles("HOSPITAL")), db: Session = Depends(get_db)) -> dict:
+    emergency = db.get(EmergencyRequest, emergency_id)
+    if not emergency:
+        raise HTTPException(404, "Emergency request not found")
+    return await _record_hospital_response(db, emergency, user, payload)
+
+
+@app.get("/api/emergencies/{emergency_id}/nearby", tags=["emergency"])
+def nearby_emergency_hospitals(emergency_id: int, origin: str = "AMBULANCE", user: User = Depends(require_roles("AMBULANCE_DRIVER", "ADMIN")), db: Session = Depends(get_db)):
+    emergency = db.get(EmergencyRequest, emergency_id)
+    if not emergency:
+        raise HTTPException(404, "Emergency request not found")
+    _scope_emergency(db, emergency, user)
+    if origin not in {"AMBULANCE", "PICKUP"}:
+        raise HTTPException(422, "Origin must be AMBULANCE or PICKUP")
+    point = _emergency_origin(emergency)
+    if origin == "AMBULANCE":
+        location = _latest_ambulance_location(db, emergency)
+        if not location:
+            raise HTTPException(422, "Fresh ambulance GPS is unavailable; allow location access and broadcast GPS")
+        point = location["latitude"], location["longitude"]
+    if not point:
+        raise HTTPException(422, "Pickup coordinates unavailable")
+    matches, radius = _nearby_coordination_hospitals(db, *point, (emergency.details or {}).get("required_service"), demo=bool((emergency.details or {}).get("demo")))
+    return {"origin": {"latitude": point[0], "longitude": point[1], "source": origin}, "radius_km": radius, "matches": matches}
+
+
+@app.post("/api/emergencies/{emergency_id}/reassess", tags=["emergency"])
+async def reassess_emergency(emergency_id: int, user: User = Depends(require_roles("AMBULANCE_DRIVER", "ADMIN")), db: Session = Depends(get_db)):
+    emergency = db.get(EmergencyRequest, emergency_id)
+    if not emergency:
+        raise HTTPException(404, "Emergency request not found")
+    _scope_emergency(db, emergency, user)
+    result = await _reassess_assignment(db, emergency, user.id, "DRIVER_REQUEST")
+    return {**_coordination_payload(db, emergency, user), "decision": result}
 
 
 @app.post("/api/emergencies/{emergency_id}/location", tags=["emergency"])
@@ -957,11 +2189,25 @@ async def update_location(emergency_id: int, payload: LocationIn, user: User = D
     if not emergency: raise HTTPException(404, "Emergency request not found")
     driver = db.scalar(select(AmbulanceDriver).where(AmbulanceDriver.user_id == user.id))
     if not driver or driver.ambulance_id != emergency.ambulance_id: raise HTTPException(403, "You are not assigned to this emergency")
+    if emergency.status in TERMINAL_EMERGENCY_STATUSES:
+        raise HTTPException(409, "Emergency has arrived or closed")
+    observed = _as_utc(payload.observed_at) or datetime.now(timezone.utc)
+    age = (datetime.now(timezone.utc) - observed).total_seconds()
+    if age < -5 or age > _gps_max_age_seconds():
+        raise HTTPException(422, "GPS observation is stale or in the future")
+    if payload.source == "DEMO" and not (emergency.details or {}).get("demo"):
+        raise HTTPException(422, "Demo coordinates are permitted only for a labelled demo emergency")
+    previous = db.scalar(select(LocationEvent).where(LocationEvent.ambulance_id == driver.ambulance_id, LocationEvent.emergency_id == emergency.id).order_by(LocationEvent.id.desc()))
+    if previous and observed <= _as_utc(previous.observed_at or previous.created_at):
+        raise HTTPException(409, "Older GPS observation cannot replace a newer fix")
+    _claim_emergency(db, emergency)
     event = LocationEvent(emergency_id=emergency.id, ambulance_id=driver.ambulance_id, **payload.model_dump()); db.add(event)
     ambulance = db.get(Ambulance, driver.ambulance_id); ambulance.latitude, ambulance.longitude = payload.latitude, payload.longitude
+    db.commit()
     bridged = await bridge.update_location(ambulance.map_ambulance_id or ambulance.code, payload.latitude, payload.longitude, payload.speed_kmh)
+    reassessment = await _reassess_assignment(db, emergency, user.id, "GPS_UPDATE") if emergency.status in {"ACCEPTED", "DRIVER_ASSIGNED", "IN_TRANSIT"} else {"changed": False, "comparison": None}
     db.commit(); db.refresh(event)
-    return {**as_dict(event), "map_location_relayed": bridged}
+    return {**as_dict(event), "map_location_relayed": bridged, "reassessment": reassessment}
 
 
 @app.get("/api/driver/assignments", tags=["emergency"])
@@ -979,7 +2225,8 @@ def get_my_active_emergency(user: User = Depends(get_current_user), db: Session 
         patient = patient_for_user(db, user)
         query = query.where(EmergencyRequest.patient_id == patient.id)
     elif user.role == "HOSPITAL":
-        query = query.where(EmergencyRequest.hospital_id == user.hospital_id)
+        emergency_ids = select(EmergencyHospitalResponse.emergency_id).where(EmergencyHospitalResponse.hospital_id == user.hospital_id)
+        query = query.where(EmergencyRequest.id.in_(emergency_ids))
     elif user.role == "AMBULANCE_DRIVER":
         driver = db.scalar(select(AmbulanceDriver).where(AmbulanceDriver.user_id == user.id))
         if not driver: return {"has_active": False, "emergency": None}
@@ -987,7 +2234,7 @@ def get_my_active_emergency(user: User = Depends(get_current_user), db: Session 
     emergency = db.scalar(query.order_by(EmergencyRequest.created_at.desc()).limit(1))
     if not emergency:
         return {"has_active": False, "emergency": None}
-    return {"has_active": True, "emergency": as_dict(emergency)}
+    return {"id": emergency.id, "has_active": True, "emergency": as_dict(emergency)}
 
 
 INITIAL_SAFETY_MESSAGES = {
@@ -1611,4 +2858,3 @@ if os.path.exists(MAP_FRONTEND_DIR):
 
 # Mount the frontend last so all `/api` routes remain available.
 app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True), name="frontend")
-

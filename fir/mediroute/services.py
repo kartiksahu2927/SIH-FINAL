@@ -180,3 +180,57 @@ class MapBridge:
             return True
         except httpx.HTTPError:
             return False
+
+    async def calculate_route(self, origin: dict, destination: dict) -> dict | None:
+        """Use the map's OSRM provider without its synthetic fallback or traffic.
+
+        The legacy /routes/calculate response cannot distinguish real geometry
+        from its geometric fallback, so it must not drive clinical transport.
+        """
+        try:
+            base = os.getenv("ROUTING_OSRM_URL", "https://router.project-osrm.org").rstrip("/")
+            url = f"{base}/route/v1/driving/{origin['lng']},{origin['lat']};{destination['lng']},{destination['lat']}"
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                response = await client.get(url, params={"overview": "full", "geometries": "geojson"}, headers={"User-Agent": "MediRoute/2.0"})
+                response.raise_for_status()
+                data = response.json()
+                if data.get("code") != "Ok" or not data.get("routes"):
+                    return None
+                route = data["routes"][0]
+                distance, duration = float(route["distance"]), float(route["duration"])
+                points = [{"lat": point[1], "lng": point[0]} for point in route["geometry"]["coordinates"]]
+                if not math.isfinite(distance) or not math.isfinite(duration) or distance < 0 or duration < 0 or len(points) < 2:
+                    return None
+                return {
+                    "distance_km": distance / 1000,
+                    "duration_min": duration / 60,
+                    "points": points,
+                    "origin": origin,
+                    "destination": destination,
+                    "provider": "osrm",
+                    "traffic_available": False,
+                    "available_at": utc_iso(),
+                }
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
+            return None
+
+    async def update_destination(self, map_request_id: str, payload: dict) -> dict | None:
+        """Optional versioned external adapter; the legacy service lacks this API.
+
+        Enable only after deploying the documented compatible interface. Local
+        map rendering uses the existing map.js via the authenticated host page.
+        """
+        if os.getenv("MAP_DESTINATION_UPDATE_ENABLED", "false").lower() != "true":
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                response = await client.post(
+                    f"{self.base_url}/api/emergency/destination",
+                    json={"request_id": map_request_id, **payload},
+                    headers={"Authorization": "Bearer " + os.getenv("MAP_BRIDGE_TOKEN", "")},
+                )
+                response.raise_for_status()
+                result = response.json()
+                return result.get("data", result) if isinstance(result, dict) else None
+        except (httpx.HTTPError, ValueError, TypeError):
+            return None

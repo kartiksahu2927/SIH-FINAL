@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MediRoute assigned road route</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>body{margin:0;font:14px system-ui;color:#123;background:#eef7f6}#summary{padding:10px}#map,#leaflet-map{height:calc(100vh - 65px);min-height:280px}#map{display:none}</style>
+</head>
+<body>
+  <div id="summary" role="status">Waiting for the authenticated emergency assignment.</div>
+  <div id="map"></div><div id="leaflet-map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- The existing map implementation is served read-only, not copied. -->
+  <script src="/coordination-map/library.js"></script>
+  <script src="/coordination-map.js"></script>
+</body>
+</html>

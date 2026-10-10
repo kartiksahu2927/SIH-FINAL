@@ -45,6 +45,9 @@ const i18nData = {
     settings: "Settings",
     audit_logs: "Audit Logs",
     facilities: "Facilities",
+    facility_discovery: "Facility Discovery",
+    healthcare_schemes: "Healthcare Schemes",
+    scheme_search: "Search Government Healthcare Schemes",
     healthcare_analytics: "Healthcare Analytics",
     quality_indicators: "Quality Indicators",
     referral_monitoring: "Referral Monitoring",
@@ -1427,6 +1430,7 @@ const state = {
   recognitionRunning: false,
   activeRecognizer: null,
   showEmergencyForm: false,
+  schemeFilters: {},
   i18n: i18nData[localStorage.getItem('mediroute_lang') || 'en'] || i18nData.en
 };
 
@@ -1493,11 +1497,197 @@ function table(rows, columns) {
       </table>
     </div>` : `<p class="muted">${escapeHtml(t('no_records', 'No records yet.'))}</p>`;
 }
+
+function externalLink(url, label) {
+  if (!/^https?:\/\//i.test(String(url || ''))) return '';
+  return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
+}
+
+function statusPill(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return '';
+  const normalized = String(value).trim().toUpperCase();
+  const cls = /REJECTED|DUPLICATE|INACTIVE/i.test(normalized) ? 'pill pill-danger' : /PENDING|REVIEW/i.test(normalized) ? 'pill pill-warning' : 'pill';
+  const labels = {
+    APPROVED: 'Approved',
+    ACTIVE: 'Active',
+    PENDING_REVIEW: 'Pending verification',
+    PENDING_VERIFICATION: 'Pending verification',
+    REVIEW_REQUIRED: 'Needs review',
+    REJECTED: 'Rejected',
+    DUPLICATE: 'Duplicate',
+    INACTIVE: 'Inactive',
+    VERIFIED: 'Verified',
+    POTENTIAL_DUPLICATE: 'Possible duplicate',
+    ALREADY_EXISTS: 'Existing record',
+    NEW_DISCOVERY: 'New discovery'
+  };
+  return `<span class="${cls}">${escapeHtml(labels[normalized] || normalized.replace(/_/g, ' '))}</span>`;
+}
+
+function formatSchemeDate(value) {
+  if (!value) return 'Unavailable';
+  const raw = String(value);
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw) ? raw : `${raw}Z`;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return 'Unavailable';
+  const formatted = new Intl.DateTimeFormat('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Kolkata' })
+    .format(date)
+    .replace(/\b(am|pm)\b/i, match => match.toUpperCase());
+  return `${formatted} IST`;
+}
+
+function schemeDetailRow(label, value, fallback = '') {
+  const text = Array.isArray(value) ? value.filter(Boolean).join('; ') : String(value || '');
+  if (!text && !fallback) return '';
+  return `<p class="scheme-detail-row"><strong>${escapeHtml(label)}</strong>${escapeHtml(text || fallback)}</p>`;
+}
+
+function sourceList(urls = []) {
+  const values = [...new Set((urls || []).filter(url => /^https?:\/\//i.test(String(url))))];
+  return values.length
+    ? values.map((url, index) => externalLink(url, `Source page ${index + 1}`)).join('')
+    : '<span class="muted">Official source link unavailable.</span>';
+}
+
+function schemeLinks(item) {
+  const information = externalLink(item.official_information_url, 'Official information');
+  const application = externalLink(item.official_application_url, 'Application portal');
+  return `<div class="scheme-link-list">${information || '<span class="muted">Official link unavailable</span>'}${application || '<span class="muted">Application portal unavailable</span>'}${sourceList(item.source_urls)}</div>`;
+}
+
+function renderSchemeCards(items, reviewer = false) {
+  if (!items?.length) {
+    return reviewer
+      ? `<div class="callout scheme-empty-state"><strong>No scheme discoveries are waiting for review.</strong><p class="muted" style="margin:6px 0 0;">Run an official-source discovery or refresh above. Provider failures are shown as errors and are not converted into records.</p></div>`
+      : `<div class="callout scheme-empty-state"><strong>No approved schemes match these filters.</strong><p class="muted" style="margin:6px 0 0;">Try a broader keyword or state. New official-source records must be reviewed and approved before they appear here.</p></div>`;
+  }
+  return `<div class="scheme-grid">${items.map(item => {
+    const title = item.display_name || 'Scheme name unavailable — source review required';
+    const qualityNotice = item.data_quality_issue ? `<p class="callout warning" style="margin:0 0 12px;">${escapeHtml(item.data_quality_issue)}</p>` : '';
+    const description = String(item.description || '').trim();
+    const descriptionPreview = description.length > 320 ? `${description.slice(0, 317).trimEnd()}…` : description;
+    const fullDescription = description.length > 320 ? schemeDetailRow('Full description', description) : '';
+    const authority = item.government_authority ? `<span><strong>Issuing authority:</strong> ${escapeHtml(item.government_authority)}</span>` : '';
+    const coverage = item.geographic_coverage ? `<span><strong>Coverage:</strong> ${escapeHtml(item.geographic_coverage)}</span>` : '';
+    const meta = authority || coverage ? `<div class="scheme-card-meta">${authority}${coverage}</div>` : '<p class="muted">Issuing authority and coverage are unavailable from the source.</p>';
+    return `
+    <article class="card scheme-card">
+      <div class="scheme-card-header">
+        <h3 class="scheme-card-title">${escapeHtml(title)}</h3>
+        ${statusPill(item.verification_status)}
+      </div>
+      ${qualityNotice}
+      <p class="scheme-card-description">${escapeHtml(descriptionPreview || 'Description unavailable from the official source.')}</p>
+      ${meta}
+      <details>
+        <summary>View details</summary>
+        <div class="scheme-detail-list">
+          ${fullDescription}
+          ${schemeDetailRow('Benefits', item.benefits, 'Unavailable from the source.')}
+          ${schemeDetailRow('Eligibility', item.eligibility, 'Unavailable from the source.')}
+          ${schemeDetailRow('Income conditions', item.income_conditions, 'Unavailable from the source.')}
+          ${schemeDetailRow('Beneficiary category', item.beneficiary_categories, 'Unavailable from the source.')}
+          ${schemeDetailRow('Required documents', item.required_documents, 'Unavailable from the source.')}
+          ${schemeDetailRow('Application instructions', item.application_process, 'Unavailable from the source.')}
+          ${schemeDetailRow('Last checked', formatSchemeDate(item.last_checked_at), 'Unavailable')}
+        </div>
+        ${schemeLinks(item)}
+        ${reviewer ? `<p class="muted">Review note: ${escapeHtml(item.review_note || 'None')}</p>` : ''}
+      </details>
+      ${reviewer && ['PENDING_REVIEW','REVIEW_REQUIRED'].includes(item.verification_status) ? `<div class="review-actions"><button type="button" class="scheme-review" data-id="${item.id}" data-status="APPROVED">Approve</button><button type="button" class="quiet scheme-review" data-id="${item.id}" data-status="REVIEW_REQUIRED">Needs review</button><button type="button" class="danger scheme-review" data-id="${item.id}" data-status="REJECTED">Reject</button></div>` : ''}
+    </article>`;
+  }).join('')}</div>`;
+}
+
+function validSchemeResponse(result) {
+  if (!result || !Array.isArray(result.items) || typeof result.total !== 'number') {
+    throw new Error('The scheme service returned an invalid response. Please try again.');
+  }
+  return result;
+}
+
+function renderApprovedSchemeResults(result) {
+  return `
+    <div class="callout" style="margin-bottom:14px;">${escapeHtml(result.message || 'Results are limited to approved and active records.')}</div>
+    ${card(`Approved schemes (${result.total})`, renderSchemeCards(result.items))}
+  `;
+}
+
+function renderSchemeFreshness(stats = {}, reviewer = false) {
+  const pending = reviewer && stats.pending_count !== undefined
+    ? `<div class="scheme-freshness-item"><strong>${escapeHtml(stats.pending_count ?? 'Unavailable')}</strong><span>Pending review</span></div>` : '';
+  return `
+    <div class="scheme-freshness">
+      <div class="scheme-freshness-item"><strong>${escapeHtml(stats.approved_count ?? 'Unavailable')}</strong><span>Approved schemes</span></div>
+      ${pending}
+      <div class="scheme-freshness-item"><strong>${escapeHtml(formatSchemeDate(stats.last_successful_refresh))}</strong><span>Last successful refresh</span></div>
+      <div class="scheme-freshness-item"><strong>${escapeHtml(formatSchemeDate(stats.last_checked_at))}</strong><span>Latest approved record check</span></div>
+    </div>
+  `;
+}
+
+function bindSchemeDetailToggles() {
+  document.querySelectorAll('.scheme-card details').forEach(details => {
+    const summary = details.querySelector('summary');
+    if (!summary) return;
+    const update = () => { summary.textContent = details.open ? 'Hide details' : 'View details'; };
+    details.addEventListener('toggle', update);
+    update();
+  });
+}
+
+function renderSchemeFinder(result = null, error = null) {
+  const filters = state.schemeFilters || {};
+  const resultMarkup = result
+    ? renderApprovedSchemeResults(result)
+    : `<div class="danger-callout" role="alert"><strong>Scheme search is unavailable.</strong><p>${escapeHtml(error?.message || 'The approved scheme service could not be reached.')}</p><p>Please try again. An unavailable search is not shown as zero results.</p></div>`;
+  return `
+    <div class="callout warning"><strong>Informational guidance:</strong> displayed scheme information comes from reviewed government sources. It is not an official eligibility decision; confirm current rules with the linked authority.</div>
+    <div class="two-col scheme-search-layout">
+      ${card(t('scheme_search', 'Search Government Healthcare Schemes'), `
+        <form id="scheme-search-form" class="scheme-search-form">
+          <label>Keyword<input name="keyword" value="${escapeHtml(filters.keyword || '')}" placeholder="e.g. maternity, insurance, Ayushman"></label>
+          <label>State or coverage<input name="state" value="${escapeHtml(filters.state || '')}" placeholder="e.g. Uttar Pradesh"></label>
+          <label>Category<input name="category" value="${escapeHtml(filters.category || '')}" placeholder="e.g. maternal health"></label>
+          <label>Beneficiary category<input name="beneficiary" value="${escapeHtml(filters.beneficiary || '')}" placeholder="e.g. senior citizens"></label>
+          <button type="submit">Search approved schemes</button>
+        </form>
+      `)}
+      ${card('Source freshness', `<p>Patient search uses stored approved records and does not trigger live research. Missing fields mean the official source did not publish them.</p>${renderSchemeFreshness(result?.stats || {})}`)}
+    </div>
+    <div id="scheme-results">${resultMarkup}</div>
+  `;
+}
+
+function renderFacilityDiscoveryCards(items) {
+  if (!items?.length) return `<p class="muted">No stored facility discoveries yet. Run a search to begin.</p>`;
+  return `<div class="grid">${items.map(item => `
+    <article class="card discovery-card">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
+        <h3>${escapeHtml(item.name || 'Unnamed facility')}</h3>
+        ${statusPill(item.verification_status)}
+      </div>
+      <p class="label">${escapeHtml(item.facility_type || item.requested_facility_type || 'Facility type unavailable')} · ${escapeHtml(item.search_location || '')}</p>
+      <p>${escapeHtml(item.address || 'Address unavailable from the source.')}</p>
+      <p><strong>Phone:</strong> ${escapeHtml(item.phone || 'Unavailable')} · <strong>Duplicate check:</strong> ${statusPill(item.duplicate_kind)}</p>
+      <details>
+        <summary>View published details</summary>
+        <p><strong>District/state:</strong> ${escapeHtml([item.district, item.state, item.postal_code].filter(Boolean).join(', ') || 'Unavailable')}</p>
+        <p><strong>Services:</strong> ${escapeHtml((item.services || []).join(', ') || 'Unavailable')}</p>
+        <p><strong>Specialties:</strong> ${escapeHtml((item.specialties || []).join(', ') || 'Unavailable')}</p>
+        <p><strong>Discovered:</strong> ${escapeHtml(item.discovered_at || 'Unavailable')} · <strong>Last checked:</strong> ${escapeHtml(item.last_checked_at || 'Unavailable')}</p>
+        <p>${externalLink(item.source_url, 'Open source page') || '<span class="muted">Source URL unavailable.</span>'}</p>
+        ${sourceList(item.source_urls)}
+        ${item.duplicate_match_id ? `<p class="muted">Possible existing trusted hospital ID: ${escapeHtml(item.duplicate_match_id)}</p>` : ''}
+      </details>
+      ${['PENDING_VERIFICATION','POTENTIAL_DUPLICATE'].includes(item.verification_status) ? `<div class="review-actions"><button type="button" class="facility-review" data-id="${item.id}" data-status="VERIFIED">Verify</button><button type="button" class="quiet facility-review" data-id="${item.id}" data-status="DUPLICATE">Mark duplicate</button><button type="button" class="danger facility-review" data-id="${item.id}" data-status="REJECTED">Reject</button></div>` : ''}
+    </article>`).join('')}</div>`;
+}
 function renderMapFrame(type = 'ambulance', title = '') {
   const isHospital = type === 'hospital';
   const frameId = 'map-iframe-elem';
 
-  const mapBaseUrl = 'https://mediroute-map.onrender.com/';
+  const mapBaseUrl = (state.mapBaseUrl || '/map-live').replace(/\/$/, '');
 
   const ambSrc = `${mapBaseUrl}/`;
   const hospSrc = `${mapBaseUrl}/hospital`;
@@ -1520,8 +1710,8 @@ function renderMapFrame(type = 'ambulance', title = '') {
           <a href="${currentSrc}" target="_blank" style="padding: 5px 12px; font-size: 0.8rem; background: #0284c7; color: #fff; border-radius: 6px; text-decoration: none; font-weight: 700; display: inline-flex; align-items: center; gap: 4px;">↗ ${escapeHtml(t('open_fullscreen', 'Full Window'))}</a>
         </div>
       </div>
-      <div style="position: relative; width: 100%; height: 580px; background: #0f172a;">
-        <iframe id="${frameId}" src="${currentSrc}" style="width: 100%; height: 100%; border: 0; display: block;" title="${escapeHtml(title || 'Live Emergency Map')}" loading="eager"></iframe>
+      <div class="map-viewport">
+        <iframe id="${frameId}" class="map-iframe" src="${currentSrc}" title="${escapeHtml(title || 'Live Emergency Map')}" loading="eager"></iframe>
       </div>
     </article>
   `;
@@ -1914,12 +2104,12 @@ async function updateEmergencyTelemetry() {
 }
 
 const navigation = {
-  PATIENT: ['Dashboard','Health Record','Appointments','Consultations','Referrals','Diagnostics','Medicines','Follow-up','Emergency','Feedback','Ratings','Complaints','Notifications','Profile','Terms & Conditions'],
+  PATIENT: ['Dashboard','Health Record','Appointments','Consultations','Referrals','Diagnostics','Medicines','Follow-up','Healthcare Schemes','Emergency','Feedback','Ratings','Complaints','Notifications','Profile','Terms & Conditions'],
   HOSPITAL: ['Dashboard','Patients','Appointments','Queue','Emergency','Referrals','Treatment','Diagnostics','Medicines','Complaints','Facility','Notifications','Terms & Conditions'],
   DOCTOR: ['Dashboard','Patients','Appointments','Queue','Treatment','Consultations','Referrals','Diagnostics','Medicines','Notifications','Terms & Conditions'],
   AMBULANCE_DRIVER: ['Dashboard','Emergency Assignment','Patient Pickup','Hospital Destination','Navigation','Trip Status','History','Terms & Conditions'],
-  ADMIN: ['Dashboard','Users','Hospitals','Complaints','Escalations','Quality','Analytics','Settings','Audit Logs','Terms & Conditions'],
-  GOVERNMENT_AUTHORITY: ['Dashboard','Facilities','Healthcare Analytics','Quality Indicators','Complaints','Escalations','Referral Monitoring','Medicine/Diagnostic Availability','Emergency Analytics','Terms & Conditions']
+  ADMIN: ['Dashboard','Users','Hospitals','Facility Discovery','Healthcare Schemes','Complaints','Escalations','Quality','Analytics','Settings','Audit Logs','Terms & Conditions'],
+  GOVERNMENT_AUTHORITY: ['Dashboard','Facilities','Facility Discovery','Healthcare Schemes','Healthcare Analytics','Quality Indicators','Complaints','Escalations','Referral Monitoring','Medicine/Diagnostic Availability','Emergency Analytics','Terms & Conditions']
 };
 
 function renderNav() {
@@ -2101,6 +2291,15 @@ async function renderPatient(page) {
   if (page === 'Follow-up') {
     return card(t('high_risk_followup', 'High-Risk Follow-up'), list(dashboard.follow_ups, f => `<strong>${escapeHtml(f.condition)}</strong> · ${escapeHtml(f.due_on)} · <span class="pill">${escapeHtml(f.status)}</span>`));
   }
+  if (page === 'Healthcare Schemes') {
+    const params = new URLSearchParams(state.schemeFilters || {});
+    try {
+      const result = validSchemeResponse(await api(`/healthcare-schemes${params.toString() ? `?${params.toString()}` : ''}`));
+      return renderSchemeFinder(result);
+    } catch (error) {
+      return renderSchemeFinder(null, error);
+    }
+  }
   if (page === 'Emergency') {
     if (state.activeEmergencyId && !state.showEmergencyForm) {
       try {
@@ -2277,16 +2476,7 @@ async function renderHospital(page) {
     `;
   }
   if (page === 'Emergency') {
-    const items = await api('/hospitals/me/emergencies');
-    return `
-      ${renderMapFrame('hospital', t('emergency', 'Live JS Hospital Emergency Admission & Reception Map'))}
-      ${card(t('emergency_coordination', 'Emergency Coordination'), `${table(items, [
-        { key: 'id', label: t('emergency_id', 'Emergency ID') },
-        { key: 'status', label: t('status', 'Status') },
-        { html: e => escapeHtml(e.details?.condition || '—'), label: t('condition', 'Condition') },
-        { html: e => `<button type="button" class="quiet" onclick="openStaffFirstAidModal(${e.id})" style="padding:4px 10px;font-size:0.8rem;font-weight:700;border:1px solid #087f76;color:#087f76;border-radius:6px;background:#f0fdf4;cursor:pointer;">📋 First-Aid Log</button>`, label: 'Emergency Assistant' }
-      ])}`)}
-    `;
+    return Coordination.view(true);
   }
   if (page === 'Complaints') {
     const items = await api('/hospitals/me/complaints');
@@ -2437,11 +2627,67 @@ async function renderAdmin(page) {
   if (page === 'Quality') {
     return card(t('quality_review', 'Quality Review'), `<button id="recalc-quality">${escapeHtml(t('recalculate_quality_btn', 'Recalculate Transparent Indicators'))}</button><div id="quality-results" style="margin-top:14px;"></div>`);
   }
+  if (page === 'Facility Discovery') {
+    const result = await api('/facility-discoveries?status=PENDING_VERIFICATION&page_size=50');
+    return `
+      <div class="callout warning"><strong>Review-only directory tool:</strong> discovered facilities are not emergency destinations until an authorized reviewer verifies them. Published web information does not prove live capacity, staffing, equipment, or acceptance.</div>
+      ${card('Discover hospitals and healthcare facilities', `
+        <form id="facility-discovery-form" class="two-col">
+          <label>Search location<input name="location" required minlength="2" maxlength="255" placeholder="State, district, city, or rural block"></label>
+          <label>Facility type (optional)<input name="facility_type" maxlength="100" placeholder="Hospital, PHC, clinic, diagnostic centre"></label>
+          <button type="submit">Search with TinyFish</button>
+        </form>
+        <p class="muted" style="margin-top:10px;">Searches are rate-limited and recent results are reused. TinyFish credentials stay on the backend.</p>
+      `)}
+      ${card(`Pending facility reviews (${result.total})`, renderFacilityDiscoveryCards(result.items))}
+    `;
+  }
+  if (page === 'Healthcare Schemes') {
+    const [result, summary] = await Promise.all([
+      api('/healthcare-schemes/discoveries?page_size=50'),
+      api('/healthcare-schemes/summary'),
+    ]);
+    return `
+      <div class="callout warning"><strong>Official-source review:</strong> approve only records with an official government information URL and enough evidence for a human reviewer. Patients see approved and active records only.</div>
+      ${card('Discover or refresh government schemes', `
+        <form id="scheme-discovery-form" class="two-col scheme-search-form">
+          <label>Keyword<input name="keyword" maxlength="200" placeholder="e.g. health insurance, maternal care"></label>
+          <label>State<input name="state" maxlength="120" placeholder="Optional state or coverage"></label>
+          <label>Category<input name="category" maxlength="120" placeholder="Optional healthcare category"></label>
+          <label>Beneficiary category<input name="beneficiary" maxlength="120" placeholder="Optional beneficiary group"></label>
+          <label style="display:flex;align-items:center;gap:8px;"><input name="force_refresh" type="checkbox" value="true" style="width:auto;margin:0;"> Refresh live official sources</label>
+          <button type="submit">Search / refresh official sources</button>
+        </form>
+      `)}
+      ${card('Source freshness', `${renderSchemeFreshness(summary, true)}<p class="muted" style="margin:10px 0 0;">Use the refresh checkbox to run a new official-source lookup. Ordinary patient browsing never triggers TinyFish.</p>`)}
+      ${card(`Scheme review queue (${result.total})`, renderSchemeCards(result.items, true))}
+    `;
+  }
   return card(page, '<p class="muted">Administration operational records view.</p>');
 }
 
 async function renderGovernment(page) {
   const data = await api('/government/dashboard');
+  if (page === 'Facility Discovery') {
+    const result = await api('/facility-discoveries?status=PENDING_VERIFICATION&page_size=50');
+    return `
+      <div class="callout warning"><strong>Authorized directory review:</strong> verify sources before considering a discovery for the trusted directory. The emergency workflow and live map availability remain authoritative.</div>
+      ${card('Hospital and facility discovery', `<form id="facility-discovery-form" class="two-col"><label>Search location<input name="location" required minlength="2" placeholder="District, city, state, or rural area"></label><label>Facility type (optional)<input name="facility_type" placeholder="Hospital, PHC, clinic"></label><button type="submit">Search with TinyFish</button></form><p class="muted" style="margin-top:10px;">Recent identical searches use stored results to control external API usage.</p>`)}
+      ${card(`Pending facility reviews (${result.total})`, renderFacilityDiscoveryCards(result.items))}
+    `;
+  }
+  if (page === 'Healthcare Schemes') {
+    const [result, summary] = await Promise.all([
+      api('/healthcare-schemes/discoveries?page_size=50'),
+      api('/healthcare-schemes/summary'),
+    ]);
+    return `
+      <div class="callout warning"><strong>Scheme review queue:</strong> only approved, active records appear in the patient finder. Information remains informational and source-backed.</div>
+      ${card('Discover government healthcare schemes', `<form id="scheme-discovery-form" class="two-col scheme-search-form"><label>Keyword<input name="keyword" maxlength="200" placeholder="e.g. health insurance"></label><label>State<input name="state" maxlength="120" placeholder="Optional state or coverage"></label><label>Category<input name="category" maxlength="120" placeholder="Optional healthcare category"></label><label>Beneficiary category<input name="beneficiary" maxlength="120" placeholder="Optional beneficiary group"></label><label style="display:flex;align-items:center;gap:8px;"><input name="force_refresh" type="checkbox" value="true" style="width:auto;margin:0;"> Refresh live official sources</label><button type="submit">Search / refresh official sources</button></form>`)}
+      ${card('Source freshness', `${renderSchemeFreshness(summary, true)}<p class="muted" style="margin:10px 0 0;">Use the refresh checkbox to run a new official-source lookup. Ordinary patient browsing never triggers TinyFish.</p>`)}
+      ${card(`Scheme review queue (${result.total})`, renderSchemeCards(result.items, true))}
+    `;
+  }
   return `
     <div class="callout">${escapeHtml(data.privacy_note)}</div>
     <div class="grid">
@@ -2454,39 +2700,8 @@ async function renderGovernment(page) {
 }
 
 async function renderDriver(page) {
-  const assignments = await api('/driver/assignments');
-  return `
-    ${renderMapFrame('ambulance', t('live_map', 'Ambulance GPS Navigation, Real Road Route & Live Dispatch'))}
-    <div class="two-col">
-      ${card(t('assigned_emergency_response', 'Assigned Emergency Response'), table(assignments, [
-        { key: 'id', label: t('emergency_id', 'Emergency ID') },
-        { key: 'status', label: t('status', 'Status') },
-        { html: r => escapeHtml(r.details?.condition || '—'), label: t('condition', 'Condition') },
-        { html: r => `<button type="button" class="quiet" onclick="openStaffFirstAidModal(${r.id})" style="padding:4px 10px;font-size:0.8rem;font-weight:700;border:1px solid #b91c1c;color:#b91c1c;border-radius:6px;background:#fef2f2;cursor:pointer;">📋 First-Aid Log</button>`, label: 'First-Aid Log' }
-      ]))}
-      ${card(t('live_location_broadcast', 'Live Ambulance Location & Address Broadcast'), `
-        <form id="location-form">
-          <label>${escapeHtml(t('emergency_id', 'Emergency ID'))}<input name="emergency_id" type="number" value="${assignments[0]?.id || 1}" required></label>
-          <label>Ambulance Current Address / Landmark
-            <input name="address" id="driver-address-input" placeholder="e.g. NH-19 Highway Mile 42, Mathura" value="K.D. Medical College Campus, Mathura" required>
-          </label>
-          <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">
-            <button type="button" class="chip" onclick="document.getElementById('driver-address-input').value='K.D. Medical College Campus, Mathura'">KD Campus</button>
-            <button type="button" class="chip" onclick="document.getElementById('driver-address-input').value='NH-19 Highway Corridor Mile 42'">NH-19 Highway</button>
-            <button type="button" class="chip" onclick="document.getElementById('driver-address-input').value='Nayati Medicity Sector Corridor'">Nayati Medicity</button>
-            <button type="button" class="chip" onclick="document.getElementById('driver-address-input').value='Mathura Combined District Center'">District Base</button>
-          </div>
-          <div style="background:#0f172a; border:1px solid #1e293b; border-radius:8px; padding:10px; margin-bottom:12px; font-family:'JetBrains Mono',monospace; font-size:0.75rem; color:#94a3b8;">
-            <div style="color:#38bdf8; font-weight:700; margin-bottom:4px;">📡 GEODETIC TELEMETRY STATUS</div>
-            <div>DGPS Fix: <span style="color:#34d399;">RTK Sub-meter Lock (14 SVs)</span></div>
-            <div>Grid Reference: <span style="color:#f8fafc;" id="driver-grid-ref">43R FL 5821 5932 • WGS84</span></div>
-          </div>
-          <label>${escapeHtml(t('speed_kmh', 'Speed km/h'))}<input name="speed_kmh" type="number" step="any" value="48"></label>
-          <button>${escapeHtml(t('broadcast_location_btn', 'Broadcast Location to Hospital & Map'))}</button>
-        </form>
-      `)}
-    </div>
-  `;
+  if (page === 'Notifications') return renderNotifications();
+  return Coordination.view(false);
 }
 
 async function renderNotifications() {
@@ -2780,6 +2995,7 @@ function closeTermsModal() {
 }
 
 async function renderPage() {
+  Coordination.stop();
   const content = $('#content');
   content.innerHTML = `<article class="card">${escapeHtml(t('loading', 'Loading secure data...'))}</article>`;
   setStatus('');
@@ -2807,7 +3023,9 @@ function formData(form) { return Object.fromEntries(new FormData(form)); }
 function asBool(value) { return value === 'true'; }
 
 async function bindPageEvents() {
+  Coordination.bind();
   const on = (selector, handler) => { const el = $(selector); if (el) el.onsubmit = handler; };
+  bindSchemeDetailToggles();
   const hospitalSelect = $('#hospital-select');
   if (hospitalSelect) {
     const hospitals = await api('/hospitals');
@@ -2849,8 +3067,7 @@ async function bindPageEvents() {
     };
 
     if (!navigator.geolocation) {
-      d.latitude = 27.652; d.longitude = 77.558;
-      await submitReq(d);
+      setStatus('Location permission and a fresh GPS fix are required. No fallback location was substituted.', true);
       return;
     }
     navigator.geolocation.getCurrentPosition(
@@ -2859,10 +3076,8 @@ async function bindPageEvents() {
         d.longitude = p.coords.longitude;
         await submitReq(d);
       },
-      async () => {
-        d.latitude = 27.652; d.longitude = 77.558;
-        await submitReq(d);
-      }
+      error => setStatus(`GPS unavailable: ${error.message}. No fallback location was substituted.`, true),
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
     );
   });
   on('#emergency-assistant-form', async e => {
@@ -2938,20 +3153,7 @@ async function bindPageEvents() {
   });
   on('#location-form', async e => {
     e.preventDefault();
-    const d = formData(e.target), id = +d.emergency_id;
-    const address = d.address || 'K.D. Medical College Campus, Mathura';
-    const speed = d.speed_kmh ? +d.speed_kmh : 48;
-
-    let lat = 27.64687, lng = 77.55192;
-    const lower = address.toLowerCase();
-    if (lower.includes('nh-19') || lower.includes('highway')) { lat = 27.6485; lng = 77.5542; }
-    else if (lower.includes('nayati')) { lat = 27.5645; lng = 77.6325; }
-    else if (lower.includes('district') || lower.includes('mathura')) { lat = 27.5085; lng = 77.6620; }
-    else if (lower.includes('vrindavan')) { lat = 27.5780; lng = 77.6845; }
-
-    const payload = { latitude: lat, longitude: lng, speed_kmh: speed, address: address };
-    await api(`/emergencies/${id}/location`, { method: 'POST', body: JSON.stringify(payload) });
-    setStatus(t('location_relayed', `Live location broadcasted for ${address}.`));
+    setStatus('Use Start live GPS in the emergency coordination panel.', true);
   });
   on('#consultation-form', async e => {
     e.preventDefault();
@@ -2968,6 +3170,83 @@ async function bindPageEvents() {
     for (const k in d) d[k] = +d[k];
     await api('/admin/policy', { method: 'PUT', body: JSON.stringify(d) });
     setStatus(t('policy_saved', 'Quality policy saved.'));
+  });
+  on('#scheme-search-form', async e => {
+    e.preventDefault();
+    const values = formData(e.target);
+    state.schemeFilters = Object.fromEntries(Object.entries(values).filter(([, value]) => String(value || '').trim()));
+    const results = $('#scheme-results');
+    const submit = e.target.querySelector('button[type="submit"]');
+    if (submit) { submit.disabled = true; submit.textContent = 'Searching approved records…'; }
+    if (results) results.innerHTML = '<div class="card"><p class="status">Searching approved and active schemes…</p></div>';
+    try {
+      const params = new URLSearchParams(state.schemeFilters);
+      const result = validSchemeResponse(await api(`/healthcare-schemes${params.toString() ? `?${params.toString()}` : ''}`));
+      if (results) results.innerHTML = renderApprovedSchemeResults(result);
+      bindSchemeDetailToggles();
+      setStatus(`Scheme search completed. ${result.total} verified record(s) matched.`);
+    } catch (error) {
+      if (results) results.innerHTML = `<div class="danger-callout"><strong>Scheme search failed.</strong><p>${escapeHtml(error.message)}</p><p>Please try again. No empty result was substituted for the error.</p></div>`;
+      setStatus(error.message, true);
+    } finally {
+      if (submit) { submit.disabled = false; submit.textContent = 'Search approved schemes'; }
+    }
+  });
+  on('#facility-discovery-form', async e => {
+    e.preventDefault();
+    const values = formData(e.target);
+    const submit = e.target.querySelector('button[type="submit"]');
+    if (submit) { submit.disabled = true; submit.textContent = 'Searching approved public sources…'; }
+    try {
+      const result = await api('/facility-discoveries/search', { method: 'POST', body: JSON.stringify({ location: values.location, facility_type: values.facility_type || null }) });
+      setStatus(`Facility search completed. ${result.count} stored result(s) returned.`);
+      await renderPage();
+    } catch (error) {
+      setStatus(error.message, true);
+    } finally {
+      if (submit) submit.disabled = false;
+    }
+  });
+  on('#scheme-discovery-form', async e => {
+    e.preventDefault();
+    const values = formData(e.target);
+    const submit = e.target.querySelector('button[type="submit"]');
+    if (submit) { submit.disabled = true; submit.textContent = 'Researching official sources…'; }
+    try {
+      const result = await api('/healthcare-schemes/discover', { method: 'POST', body: JSON.stringify({ keyword: values.keyword || null, state: values.state || null, category: values.category || null, beneficiary: values.beneficiary || null, force_refresh: values.force_refresh === 'true' }) });
+      setStatus(`Scheme discovery completed. ${result.count} record(s) returned for review.`);
+      await renderPage();
+    } catch (error) {
+      setStatus(error.message, true);
+    } finally {
+      if (submit) submit.disabled = false;
+    }
+  });
+  document.querySelectorAll('.facility-review').forEach(button => {
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        await api(`/facility-discoveries/${button.dataset.id}/review`, { method: 'PATCH', body: JSON.stringify({ status: button.dataset.status }) });
+        setStatus(`Facility discovery marked ${button.dataset.status.toLowerCase().replace('_', ' ')}.`);
+        await renderPage();
+      } catch (error) {
+        setStatus(error.message, true);
+        button.disabled = false;
+      }
+    };
+  });
+  document.querySelectorAll('.scheme-review').forEach(button => {
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        await api(`/healthcare-schemes/${button.dataset.id}/review`, { method: 'PATCH', body: JSON.stringify({ status: button.dataset.status, active_status: button.dataset.status === 'APPROVED' ? 'ACTIVE' : null }) });
+        setStatus(`Scheme marked ${button.dataset.status.toLowerCase().replace('_', ' ')}.`);
+        await renderPage();
+      } catch (error) {
+        setStatus(error.message, true);
+        button.disabled = false;
+      }
+    };
   });
   const quality = $('#recalc-quality');
   if (quality) {
@@ -3049,8 +3328,12 @@ function connectNotificationStream() {
   state.socket.onmessage = event => {
     const notice = JSON.parse(event.data);
     setStatus(`${notice.title}: ${notice.body}`);
+    if (notice.kind === 'EMERGENCY') Coordination.refresh();
     if (state.page === 'Notifications') renderPage();
   };
+  const socket = state.socket;
+  socket.onopen = () => Coordination.refresh();
+  socket.onclose = () => { if (state.user && state.socket === socket) setTimeout(() => { if (state.user && state.socket === socket) connectNotificationStream(); }, 2000); };
 }
 
 async function loadLanguage(lang) {
@@ -3080,6 +3363,7 @@ async function loadLanguage(lang) {
 
 async function loggedIn() {
   state.user = await api('/auth/me');
+  state.mapBaseUrl = (await api('/coordination/config')).map_url;
   state.page = 'Dashboard';
   $('#login-view').hidden = true;
   $('#app-view').hidden = false;
@@ -3230,6 +3514,7 @@ function setupAuthHandlers() {
 }
 
 $('#logout').onclick = () => {
+  Coordination.stop();
   if (state.socket) state.socket.close();
   if (window.emergencyTelemetryTimer) {
     clearInterval(window.emergencyTelemetryTimer);
@@ -3292,4 +3577,3 @@ loadLanguage(state.lang).then(() => {
     });
   }
 });
-
